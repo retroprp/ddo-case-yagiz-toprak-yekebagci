@@ -1,0 +1,78 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cmms_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cmms_secret_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-bakimplan_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cmms_user} -d ${POSTGRES_DB:-bakimplan_db}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://cmms_user:cmms_secret_pass@db:5432/bakimplan_db?sslmode=disable}
+      PORT: 8080
+      JWT_SECRET: ${JWT_SECRET:-ddo-super-secret-jwt-key-2026-bakimplan}
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  simulator:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["/app/simulator"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://cmms_user:cmms_secret_pass@db:5432/bakimplan_db?sslmode=disable}
+      SEED_VALUE: ${SEED_VALUE:-42}
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/ || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  verify:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["/app/verify"]
+    profiles: ["verify"]
+    environment:
+      API_URL: http://backend:8080
+      DATABASE_URL: ${DATABASE_URL:-postgres://cmms_user:cmms_secret_pass@db:5432/bakimplan_db?sslmode=disable}
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  pgdata:
