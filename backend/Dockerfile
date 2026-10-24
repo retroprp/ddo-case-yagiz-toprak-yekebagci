@@ -1,7 +1,7 @@
-FROM golang:1.22-alpine AS builder
+FROM golang:alpine AS builder
+ENV GOTOOLCHAIN=auto
 WORKDIR /src
 COPY go.mod ./
-# go.sum henüz yoksa go mod tidy ile indirir
 COPY . .
 RUN go mod tidy
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/api ./cmd/api
