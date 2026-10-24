@@ -1,0 +1,57 @@
+name: BakımPlan CI — Build, Test, Lint & Verify
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  backend-ci:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: cmms_user
+          POSTGRES_PASSWORD: cmms_secret_pass
+          POSTGRES_DB: bakimplan_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://cmms_user:cmms_secret_pass@localhost:5432/bakimplan_db?sslmode=disable
+      JWT_SECRET: ci-test-secret-key
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: backend/go.sum
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: backend
+
+      - name: Build Backend, Simulator & Verify binaries
+        working-directory: backend
+        run: |
+          go build -v ./cmd/api
+          go build -v ./cmd/simulator
+          go build -v ./cmd/verify
+
+      - name: Run 26 Unit & PostgreSQL Integration Tests (with Race Detector)
+        working-directory: backend
+        run: go test -v -race ./...
