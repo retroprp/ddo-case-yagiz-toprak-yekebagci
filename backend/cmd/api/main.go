@@ -10,7 +10,10 @@ import (
 	"syscall"
 	"time"
 
+	"bakimplan/internal/auth"
 	"bakimplan/internal/database"
+	"bakimplan/internal/handlers"
+	appmw "bakimplan/internal/middleware"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -40,6 +43,11 @@ func main() {
 	}
 	defer pool.Close()
 
+	// 5 Rol için Demo Kullanıcılarını Otomatik Oluştur
+	if err := handlers.SeedDefaultUsers(ctx, pool); err != nil {
+		slog.Error("failed to seed default users", "error", err)
+	}
+
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
@@ -52,7 +60,7 @@ func main() {
 		AllowCredentials: true,
 	}))
 
-	// Zorunlu Healthcheck Ucu
+	// Healthcheck
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		pingCtx, pingCancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer pingCancel()
@@ -60,19 +68,31 @@ func main() {
 		if err := pool.Ping(pingCtx); err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status":   "unhealthy",
-				"database": "disconnected",
-			})
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "unhealthy", "database": "disconnected"})
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":   "healthy",
-			"database": "connected",
-			"service":  "bakimplan-api",
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "healthy", "database": "connected", "service": "bakimplan-api"})
+	})
+
+	authHandler := handlers.NewAuthHandler(pool)
+
+	r.Route("/api/v1", func(api chi.Router) {
+		api.Use(appmw.Idempotency(pool))
+
+		// Açık Uçlar
+		api.Post("/auth/login", authHandler.Login)
+
+		// Korumalı Uçlar (JWT Zorunlu)
+		api.Group(func(protected chi.Router) {
+			protected.Use(auth.Authenticate)
+
+			protected.Get("/auth/me", authHandler.Me)
+
+			// Yalnızca Yönetici Denetim Kayıtlarını (Audit Logs) Görebilir
+			protected.With(auth.RequireRoles("yonetici")).Get("/audit-logs", authHandler.ListAuditLogs)
 		})
 	})
 
@@ -92,7 +112,6 @@ func main() {
 		}
 	}()
 
-	// Graceful Shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
