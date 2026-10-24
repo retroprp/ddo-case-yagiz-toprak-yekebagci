@@ -43,7 +43,6 @@ func main() {
 	}
 	defer pool.Close()
 
-	// 5 Rol için Demo Kullanıcılarını Otomatik Oluştur
 	if err := handlers.SeedDefaultUsers(ctx, pool); err != nil {
 		slog.Error("failed to seed default users", "error", err)
 	}
@@ -60,7 +59,6 @@ func main() {
 		AllowCredentials: true,
 	}))
 
-	// Healthcheck
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		pingCtx, pingCancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer pingCancel()
@@ -78,20 +76,55 @@ func main() {
 	})
 
 	authHandler := handlers.NewAuthHandler(pool)
+	eqHandler := handlers.NewEquipmentHandler(pool)
+	invHandler := handlers.NewInventoryHandler(pool)
+	maintHandler := handlers.NewMaintenanceHandler(pool)
+	metricsHandler := handlers.NewMetricsHandler(pool)
 
 	r.Route("/api/v1", func(api chi.Router) {
 		api.Use(appmw.Idempotency(pool))
 
-		// Açık Uçlar
 		api.Post("/auth/login", authHandler.Login)
 
-		// Korumalı Uçlar (JWT Zorunlu)
 		api.Group(func(protected chi.Router) {
 			protected.Use(auth.Authenticate)
 
 			protected.Get("/auth/me", authHandler.Me)
 
-			// Yalnızca Yönetici Denetim Kayıtlarını (Audit Logs) Görebilir
+			// F-1 & T-2: Ekipman Hiyerarşisi
+			protected.Get("/equipments/tree", eqHandler.GetTree)
+			protected.With(auth.RequireRoles("planlama", "yonetici")).Post("/equipments", eqHandler.Create)
+			protected.With(auth.RequireRoles("planlama", "yonetici")).Patch("/equipments/{id}/move", eqHandler.Move)
+			protected.With(auth.RequireRoles("teknisyen", "planlama", "uretim", "yonetici")).Post("/equipments/{id}/meter-readings", maintHandler.RecordMeterReading)
+
+			// F-2: Arıza Bildirimi
+			protected.Get("/failure-reports", maintHandler.ListFailureReports)
+			protected.With(auth.RequireRoles("uretim", "teknisyen", "planlama", "yonetici")).Post("/failure-reports", maintHandler.CreateFailureReport)
+
+			// F-3: İş Emirleri
+			protected.Get("/work-orders", maintHandler.ListWorkOrders)
+			protected.With(auth.RequireRoles("planlama", "yonetici")).Post("/work-orders", maintHandler.CreateWorkOrder)
+			protected.With(auth.RequireRoles("teknisyen", "planlama", "yonetici")).Post("/work-orders/{id}/complete", maintHandler.CompleteWorkOrder)
+
+			// F-4 & T-1: Önleyici Bakım Planları
+			protected.Get("/preventive-plans", maintHandler.ListPMPlans)
+			protected.With(auth.RequireRoles("planlama", "yonetici")).Post("/preventive-plans", maintHandler.CreatePMPlan)
+			protected.With(auth.RequireRoles("planlama", "yonetici")).Post("/preventive-plans/trigger-due", maintHandler.TriggerDueTimePMs)
+
+			// F-5 & T-3: Yedek Parça Stoğu ve Rezervasyon
+			protected.Get("/parts", invHandler.ListParts)
+			protected.With(auth.RequireRoles("depo", "yonetici")).Post("/stock-movements", invHandler.CreateStockMovement)
+			protected.With(auth.RequireRoles("depo", "teknisyen", "planlama", "yonetici")).Post("/work-orders/{id}/reserve-part", invHandler.ReservePartForWorkOrder)
+
+			// F-6: Teknisyen İş Yükü
+			protected.With(auth.RequireRoles("teknisyen", "planlama", "yonetici")).Get("/technicians/workload", maintHandler.GetTechnicianWorkload)
+
+			// F-7 & T-4: Güvenilirlik Göstergeleri (MTBF, MTTR, Availability)
+			protected.Get("/metrics/reliability", metricsHandler.GetReliabilityMetrics)
+			protected.With(auth.RequireRoles("teknisyen", "planlama", "uretim", "yonetici")).Post("/downtime-events", metricsHandler.CreateDowntimeEvent)
+			protected.With(auth.RequireRoles("planlama", "yonetici")).Patch("/downtime-events/{id}", metricsHandler.UpdateDowntimeEvent)
+
+			// Denetim Kaydı
 			protected.With(auth.RequireRoles("yonetici")).Get("/audit-logs", authHandler.ListAuditLogs)
 		})
 	})
