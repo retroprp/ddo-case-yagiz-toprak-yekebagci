@@ -12,7 +12,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16.4-alpine3.20
         env:
           POSTGRES_USER: cmms_user
           POSTGRES_PASSWORD: cmms_secret_pass
@@ -39,11 +39,11 @@ jobs:
           go-version: '1.24'
           cache-dependency-path: backend/go.sum
 
-      - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: v1.64.5
-          working-directory: backend
+      - name: Install and Run golangci-lint
+        working-directory: backend
+        run: |
+          go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.5
+          golangci-lint run --timeout=3m ./...
 
       - name: Build Backend, Simulator & Verify binaries
         working-directory: backend
@@ -52,6 +52,6 @@ jobs:
           go build -v ./cmd/simulator
           go build -v ./cmd/verify
 
-      - name: Run Unit & PostgreSQL Integration Tests (with Race Detector)
+      - name: Run 30 Unit & PostgreSQL Integration Tests (with Race Detector)
         working-directory: backend
         run: go test -v -race ./...
