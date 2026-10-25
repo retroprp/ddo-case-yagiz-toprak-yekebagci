@@ -1,154 +1,240 @@
-Markdown# BakımPlan — Test ve Doğrulama Kılavuzu (`TESTING.md`)
+# Test ve Doğrulama Kılavuzu
 
-## 1. Tek Komutla Otomatik Doğrulama (`make verify`)
+Bu doküman, BakımPlan CMMS'in **ne ile**, **nasıl** ve **hangi kanıtla** doğrulandığını
+açıklar. Üç katman vardır:
 
-Sistem ayağa kalktıktan sonra tüm gereksinimleri (`F-1`..`F-7`, `T-1`..`T-4`, `/health`, `401/403 RBAC` ve `Idempotency-Key`) otomatik olarak sınamak için:
+| Katman | Araç | Ne kanıtlar | Süre |
+|---|---|---|---|
+| **1. Uçtan uca** | `make verify` (`cmd/verify`) | Kapsam maddeleri gerçekten çalışıyor mu | ~3 s |
+| **2. Otomatik test** | `go test ./...` | Algoritmalar ve iş kuralları doğru mu | ~5 s |
+| **3. Yük testi** | `make load` (k6) | Yanıt süreleri hedefin altında mı | ~15 s |
+
+---
+
+## 1. Uçtan uca doğrulama — `make verify`
+
+Bağımsız bir Go programı (`cmd/verify`) ayağa kalkmış API'ye **gerçek HTTP** atar ve
+`PASS/FAIL` tablosu basar. Test framework'ü değildir; bu yüzden Docker imajı içinde de,
+host'tan da çalışır.
 
 ```bash
 make verify
-# Windows PowerShell'de make kurulu değilse doğrudan eşdeğer Docker komutu:
-docker compose --profile verify run --rm --build verify
-Veritabanını ilk deterministik seed (SEED_VALUE=42) haline sıfırlamak için:Bashmake reset-demo
-# veya: docker compose down -v && docker compose up --build -d
-2. Demo Kullanıcı Hesapları (Her Rol İçin)Rol KoduE-PostaParolaAçıklamayoneticiyonetici@bakimplan.localPassword123!Tüm uçlara ve /api/v1/audit-logs ekranına erişebilirplanlamaplanlama@bakimplan.localPassword123!Ekipman, iş emri ve önleyici bakım planlarını yönetirteknisyenteknisyen@bakimplan.localPassword123!İş emri tamamlar, sayaç okuması girer, parça rezerve ederuretimuretim@bakimplan.localPassword123!Sahadan arıza bildirimi ve duruş olayı açardepodepo@bakimplan.localPassword123!Yedek parça stoğunu, hareketleri ve rezervasyonları yönetir3. Doğrulama Kimlikleri, Nasıl Denenir ve Kanıt Komutları TablosuKimlikÖzellik / GörevNasıl Denenir (API / Arayüz)Beklenen SonuçKanıt KomutuF-1Ekipman HiyerarşisiGET /api/v1/equipments/tree2.000 ekipman 4 seviyeli ağaç olarak döner (200 OK)docker compose --profile verify run --rm verify (F-1 satırı)F-2Arıza BildirimiPOST /api/v1/failure-reports (Idempotency-Key ile)Arıza kaydı açılır (201), aynı key ile tekrarda yeni kayıt açılmazgo test -v -run TestIntegration02 ./internal/handlersF-3İş Emri YönetimiGET /api/v1/work-orders?limit=25&cursor=...Keyset sayfalama ile iş emirleri ve next_cursor dönergo test -v -run TestIntegration10 ./internal/handlersF-4Önleyici Bakım PlanlarıPOST /api/v1/preventive-plansSüre ve sayaç bazlı bakım planı kaydedilir (201 Created)docker compose --profile verify run --rm verify (F-4 satırı)F-5Yedek Parça StoğuGET /api/v1/partsStok = hareketlerin toplamı ve kritik sıfır stok uyarısı dönerdocker compose --profile verify run --rm verify (F-5 satırı)F-6Teknisyen İş YüküGET /api/v1/technicians/workloadTeknisyenlerin aktif ve tamamlanan iş sayıları listelenirgo test -v -run TestIntegration11 ./internal/handlersF-7Güvenilirlik PaneliGET /api/v1/metrics/reliabilityMTBF, MTTR, Availability ve En Problemli 10 Ekipman dönerdocker compose --profile verify run --rm verify (F-7 satırı)T-1Önleyici Bakım TakvimiPOST /api/v1/equipments/{id}/meter-readings & /completeEşik aşılınca otomatik iş emri açılır; gecikenler birikmez; planned/completed sonraki tarihi hesaplarcd backend && go test -v -run "TestIntegration07|TestIntegration08" ./internal/handlersT-2Ekipman Ağacı & Döngü EngellemePATCH /api/v1/equipments/6/move ({"new_parent_id": 31})Üst düğümü kendi alt ağacına taşıma 409 CYCLE_DETECTED ile reddedilir; maliyetler ağaçta toplanırcd backend && go test -v -run "TestIntegration03|TestIntegration04" ./internal/handlersT-3Yedek Parça Rezervasyonu (Yarış Durumu)POST /api/v1/work-orders/{id}/reserve-part (20 eşzamanlı goroutine)Stokta 4 adet varken 20 eşzamanlı istekten tam 4'ü 201, 16'sı 409 INSUFFICIENT_STOCK alırcd backend && go test -v -race -run "TestIntegration05|TestIntegration06" ./internal/handlersT-4MTBF, MTTR & Örtüşen DuruşlarPOST /api/v1/downtime-events (10:00-12:00 ve 11:00-13:00)İki örtüşen duruş 4 saat değil 3.0 saat olarak birleştirilir; geçmiş olay düzeltilince yeniden hesaplanırcd backend && go test -v -run "TestUnit06|TestUnit11|TestIntegration09" ./internal/handlers4. Arayüzde (http://localhost:3000) Elle Denenecek Kısa Senaryo ListesiRol Değişimi ve RBAC Testi: Üst bardan "Teknisyen" butonuna tıklayın. Sol menüde yalnızca teknisyenin yetkili olduğu ekranların kaldığını görün. Sol menüdeki "Yetki Testi" bağlantısına tıkladığınızda sunucunun 403 FORBIDDEN_ROLE döndürdüğünü kırmızı hata banner'ında doğrulayın. Tekrar "Yönetici" rolüne geçin.Görev 2 (Ekipman Ağacı ve Döngü Testi): Sol menüden "Ekipman Ağacı (F-1 / T-2)" sekmesine geçin. Tesis ve Hatların yanında alt makinelerden toplanan Roll-up Maliyet ve Roll-up Duruş saatlerini inceleyin. Sağdaki "Döngü Testi (Hat #6 → #31)" butonuna basın ve 409 [CYCLE_DETECTED] engelini görün.Görev 1 (Sayaç Bazlı Otomatik İş Emri): "Önleyici Bakım & Sayaç (F-4 / T-1)" sekmesine geçin. Sağdaki formdan Ekipman #31 için 600 saat sayaç okuması gönderin; otomatik iş emri üretildiğini görün. Aynı okumayı tekrar gönderdiğinizde yeni iş emri birikmediğini doğrulayın.Görev 3 (Parça Rezervasyonu ve Stok Uyarısı): "Yedek Parça & Depo (F-5 / T-3)" sekmesine geçin. Parça #1'in kritik stok uyarısını inceleyin ve sağdaki formdan İş Emri #1 için parça rezerve edin.Görev 4 (MTBF, MTTR ve En Problemli 10 Ekipman): "Güvenilirlik & MTBF (F-7 / T-4)" sekmesinde birleşmiş arıza sayılarını ve En Problemli 10 Ekipman tablosunu inceleyin; sağdaki formdan yeni bir duruş olayı ekleyip metriklerin anında yeniden hesaplandığını görün.
+# veya doğrudan:
+docker compose --profile verify run --rm verify
+```
+
+Örnek çıktı:
+
+```
+KİMLİK     | DURUM  | SÜRE     | KANIT / AÇIKLAMA
+--------------------------------------------------------------------------------
+HEALTH     | PASS   | 2ms      | status=healthy, database=connected
+AUTH-LOGIN | PASS   | 439ms    | 5 rol JWT doğrulandı, hatalı parola 401 reddedildi
+RBAC-403   | PASS   | 2ms      | Tokensız->401, Yetkisiz Rol->403 başarıyla engellendi
+F-1        | PASS   | 1.1s     | Kök tesis sayısı: 5 (Toplam 2000+ ekipman)
+F-2        | PASS   | 13ms     | Arıza #502 oluşturuldu ve Idempotency doğrulandı
+F-3        | PASS   | 5ms      | İş emri #6001 açıldı, next_cursor=5992
+F-4        | PASS   | 4ms      | PM Planı #101 (planned bazlı) oluşturuldu
+F-5        | PASS   | 3ms      | 50 yedek parça hareket toplamlarıyla doğrulandı
+F-6        | PASS   | 3ms      | 1 teknisyen iş yükü hesaplandı
+F-7        | PASS   | 6ms      | MTBF=16599.4s, MTTR=2.9s, Availability=%99.98
+T-1        | PASS   | 76ms     | Sayaç WO #6002 üretildi, birikmeme doğrulandı
+T-2        | PASS   | 7ms      | Alt ağaca ve kendine taşıma 409 CYCLE_DETECTED
+T-3        | PASS   | 151ms    | 15 eşzamanlı istekten tam 5 kabul, 10 stok reddi
+T-4        | PASS   | 45ms     | Örtüşen (10-12 & 11-13) -> 3.0s birleştirildi
+--------------------------------------------------------------------------------
+TÜM DOĞRULAMALAR BAŞARILI (14 / 14 PASS)!
+```
+
+> ⚠️ **Doğrulama veriyi değiştirir.** Aynı veritabanında iki kez koşturmayın; T-2/T-3
+> düşer çünkü ekipman zaten taşınmış, stok tüketilmiş olur. Her koşudan önce
+> `make reset-demo`.
+
+### Neden ayrı bir araç, neden `go test` değil?
+
+`go test` paket içi fonksiyonları sınar. `cmd/verify` ise **kullanıcının gördüğü sözleşmeyi**
+sınar: HTTP durum kodları, JSON alan adları, hata kodları. Ayrıca imaj içinden çalıştığı
+için "benim makinemde çalışıyordu" durumunu ortadan kaldırır.
+
 ---
 
-### 4. `requests.http` (VS Code REST Client Elle Deneme Koleksiyonu)
+## 2. Otomatik testler — `make test`
 
-```http
-@baseUrl = http://localhost:8080
-@apiUrl = http://localhost:8080/api/v1
+```bash
+make test
+# veya:
+cd backend && go test -v -race ./...
+```
 
-### 1. Sağlık Kontrolü (GET /health)
-GET {{baseUrl}}/health
-Accept: application/json
+**40 test**, üç kategori:
 
-### 2. Yönetici Girişi (JWT Token Al)
-# @name adminLogin
-POST {{apiUrl}}/auth/login
-Content-Type: application/json
+| Kategori | Adet | Veritabanı | Ne sınar |
+|---|---|---|---|
+| `TestUnit*` | 14 | ❌ yok | Saf fonksiyonlar (bcrypt, JWT, interval merge, vardiya, hata zarfı, RBAC) |
+| `TestIntegration*` | 16 | ✅ gerçek PostgreSQL | Uçlar + SQL davranışı |
+| `TestLifecycle*` | 6 | ✅ | Durum makinesi, atama, geçmiş |
+| `TestIdemKey*` | 4 | ✅ | Idempotency zorunluluğu ve kapsamı |
 
-{
-  "email": "yonetici@bakimplan.local",
-  "password": "Password123!"
-}
+Veritabanı erişilemezse entegrasyon testleri **`SKIP`** olur, `FAIL` olmaz. Bu bilinçli:
+CI'da PostgreSQL servis olarak tanımlı, yerelde yoksa testler yine anlamlı çalışır.
 
-###
-@token = {{adminLogin.response.body.access_token}}
+### Unit testler (14)
 
-### 3. Yanlış Parola Testi (401 Unauthorized Beklenir)
-POST {{apiUrl}}/auth/login
-Content-Type: application/json
+| Test | Doğruladığı |
+|---|---|
+| `TestUnit01` / `02` | bcrypt hash ↔ doğrulama, yanlış parola reddi |
+| `TestUnit03` / `04` | JWT üret/parse, kurcalanmış token reddi |
+| `TestUnit05`–`09` | Interval merge: boş, tek, örtüşen, iç içe, bitişik, sırasız |
+| `TestUnit10`–`12` | Vardiya içi/dışı süre hesabı, 24 saat sürekli |
+| `TestUnit13` | Standart hata zarfı `{"error":{"code","message"}}` |
+| `TestUnit14` | RBAC: yetkisiz rol → 403 |
 
-{
-  "email": "yonetici@bakimplan.local",
-  "password": "WrongPassword!"
-}
+`TestUnit05`–`09` özellikle önemli: T-4 metriğinin kalbi olan interval merging'in
+sınır durumları (bitişik aralıklar `[10,12]` + `[12,14]` → `[10,14]`) burada kilitlenir.
 
-### 4. Aktif Kullanıcı Bilgisi (GET /auth/me)
-GET {{apiUrl}}/auth/me
-Authorization: Bearer {{token}}
+### Entegrasyon testleri (16)
 
-### 5. [F-1 & T-2] Ekipman Hiyerarşisi ve Roll-up Maliyet/Duruş Ağacı
-GET {{apiUrl}}/equipments/tree
-Authorization: Bearer {{token}}
+| Test | Kapsam | Kanıt |
+|---|---|---|
+| `TestIntegration01` | 5 rol login | Her rol token alır |
+| `02` | Idempotency replay | Aynı anahtar → aynı ID |
+| `03` | Kullanıcı/uç izolasyonu | Farklı kullanıcı → 409 |
+| `04` | Cycle koruması (T-2) | Alt ağaca taşıma → 409 |
+| `05` | Seviye matrisi (T-2) | Makine → tesis → 422 |
+| `06` | Roll-up doğruluğu (T-2) | Alt ağaç maliyeti = toplam |
+| `07` | **Yarış koşulu (T-3)** | 20 eşzamanlı → 4 başarı, 16 red |
+| `08` | Tamamlamada stok tüketimi (T-3) | Rezerve → consumed + çıkış hareketi |
+| `09` | BOM uyumsuzluğu (T-3) | Yanlış parça → 422 |
+| `10` | Sayaç + birikmeme (T-1) | Eşik aşımı → 1 iş emri |
+| `11` | `calc_basis=planned` (T-1) | Gecikmeli tamamlama → planlanan tarihe göre |
+| `12` | `calc_basis=completed` (T-1) | Fiili tarihe göre |
+| `13` | MTBF/örtüşme (T-4) | Örtüşen duruşlar birleşir |
+| `14` | Keyset sayfalama (F-3) | `limit` + `cursor` |
+| `15` | Teknisyen iş yükü (F-6) | Aktif/tamamlanan sayıları |
+| `16` | Audit append-only | `UPDATE/DELETE` trigger ile engellenir |
 
-### 6. [T-2] Ekipman Ağacında Döngü (Cycle) Engelleme Testi (Hat #6 -> Altındaki Makine #31'e Taşıma -> 409 Conflict)
-PATCH {{apiUrl}}/equipments/6/move
-Authorization: Bearer {{token}}
-Content-Type: application/json
+### Lifecycle testleri (6)
 
-{
-  "new_parent_id": 31
-}
+`TestLifecycle01` akış: `acik → atandi → devam_ediyor → tamamlandi`, geçmişte 3 kayıt.
+`02` geçersiz geçişler (409). `03` atama doğrulaması (422/404). `04` iptal terminal.
+`05` RBAC. `06` iş yükü sayacı.
 
-### 7. [F-2] Arıza Bildirimi Oluşturma (Idempotency-Key Destekli)
-POST {{apiUrl}}/failure-reports
-Authorization: Bearer {{token}}
-Idempotency-Key: demo-failure-key-001
-Content-Type: application/json
+### Idempotency zorunluluğu testleri (4)
 
-{
-  "equipment_id": 31,
-  "title": "CNC Hidrolik Basınç Kaybı",
-  "description": "Üretim hattında basınç 40 bar altına düştü.",
-  "severity": "kritik"
-}
+`TestIdemKey01` anahtarsız → 400 `IDEMPOTENCY_KEY_REQUIRED`.
+`02` anahtarlı → 201. `03` GET etkilenmez. `04` kapsam 6 farklı kritik uçta doğrulanır.
 
-### 8. [F-3] İş Emirleri Listeleme (Keyset / Cursor Sayfalama)
-GET {{apiUrl}}/work-orders?limit=10
-Authorization: Bearer {{token}}
+### Race detector
 
-### 9. [F-3] Yeni İş Emri Oluşturma
-POST {{apiUrl}}/work-orders
-Authorization: Bearer {{token}}
-Content-Type: application/json
+```bash
+go test -race ./...
+```
 
-{
-  "equipment_id": 31,
-  "wo_type": "corrective",
-  "priority": "acil",
-  "title": "Hidrolik Valf Değişimi",
-  "assigned_to": 1,
-  "labor_cost_kurus": 85000
-}
+`-race`, eşzamanlı erişimleri izler. T-3'ün yarış testi 20 goroutine açtığı için bu
+bayrak olmadan test eksik kalır. Son koşu: **temiz** (data race yok).
 
-### 10. [F-4 & T-1] Önleyici Bakım Planları Listesi
-GET {{apiUrl}}/preventive-plans
-Authorization: Bearer {{token}}
+---
 
-### 11. [T-1] Sayaç Okuması Gönderme ve İdempotent Otomatik İş Emri Üretimi
-POST {{apiUrl}}/equipments/31/meter-readings
-Authorization: Bearer {{token}}
-Content-Type: application/json
+## 3. Yük testi — `make load`
 
-{
-  "reading_hours": 650
-}
+```bash
+make load
+# hedefi değiştirmek için:
+K6_API_URL=http://localhost:8080 make load
+```
 
-### 12. [T-1] Günü Gelen Önleyici Bakımları Tetikleme (Gecikenler Birikmez)
-POST {{apiUrl}}/preventive-plans/trigger-due
-Authorization: Bearer {{token}}
-Content-Type: application/json
+k6 iki senaryo koşar (farklı uçlar farklı SLO'lara tabi):
 
-{}
+| Senaryo | VU | Eşik | Ölçülen |
+|---|---|---|---|
+| `reliability` (`/metrics/reliability`) | 20 | `p(95) < 250 ms` | **~11 ms** |
+| `tree` (`/equipments/tree`) | 5 | `p(95) < 3000 ms` | **~790 ms** (577 KB gövde) |
 
-### 13. [F-5 & T-3] Yedek Parça Stoğu (Stok = Hareketlerin Toplamı)
-GET {{apiUrl}}/parts
-Authorization: Bearer {{token}}
+`http_req_failed` eşiği `rate < 0.01`, `checks` eşiği `rate > 0.99`.
 
-### 14. [T-3] İş Emrine Yedek Parça Rezerve Etme (SELECT ... FOR UPDATE & BOM Kontrollü)
-POST {{apiUrl}}/work-orders/1/reserve-part
-Authorization: Bearer {{token}}
-Content-Type: application/json
+**Neden iki ayrı eşik?** Tek eşik koymak, en yavaş ucun tüm testi belirlemesine yol açar.
+577 KB'lık ağaç yanıtı 250 ms eşiğini fiziksel olarak imkânsız kılar; tek eşikle test
+sürekli kırmızı kalır ve gerçek regresyonu gizler.
 
-{
-  "part_id": 1,
-  "warehouse_id": 1,
-  "quantity": 1
-}
+---
 
-### 15. [F-6] Teknisyen İş Yükü Listesi
-GET {{apiUrl}}/technicians/workload
-Authorization: Bearer {{token}}
+## 4. Kapsam matrisi
 
-### 16. [F-7 & T-4] Güvenilirlik Göstergeleri (MTBF, MTTR, Availability & Top 10 Problemli Ekipman)
-GET {{apiUrl}}/metrics/reliability
-Authorization: Bearer {{token}}
+Her gereksinim en az bir otomatik teste bağlıdır:
 
-### 17. [T-4] Yeni Duruş Olayı Ekleme (Örtüşen Duruş Birleştirme Testi)
-POST {{apiUrl}}/downtime-events
-Authorization: Bearer {{token}}
-Content-Type: application/json
+| Kimlik | Gereksinim | `make verify` | `go test` | Elle |
+|---|---|---|---|---|
+| F-1 | Ekipman hiyerarşisi | ✅ | `Integration04` | `/equipments` |
+| F-2 | Arıza bildirimi | ✅ | `Integration02` | `/failures` |
+| F-3 | İş emri + sayfalama | ✅ | `Integration14`, `Lifecycle01-06` | `/workorders` |
+| F-4 | Önleyici bakım | ✅ | `Integration10-12` | `/pm` |
+| F-5 | Stok + rezervasyon | ✅ | `Integration07-09` | `/inventory` |
+| F-6 | Teknisyen iş yükü | ✅ | `Integration15`, `Lifecycle06` | `/workload` |
+| F-7 | MTBF/MTTR/Availability | ✅ | `Integration13` | `/reliability` |
+| T-1 | Bakım takvimi | ✅ | `Integration10-12` | sayaç formu |
+| T-2 | Ağaç + cycle | ✅ | `Integration04-06` | ağaçta taşıma |
+| T-3 | Yarış koşulu | ✅ | `Integration07` | rezervasyon formu |
+| T-4 | Interval merge | ✅ | `Unit05-09`, `Integration13` | metrik ekranı |
+| — | Auth / RBAC | ✅ | `Unit01-04,14`, `Integration01` | rol geçişi |
+| — | Idempotency | ✅ | `TestIdemKey01-04` | aynı isteği tekrar |
+| — | Audit append-only | — | `Integration16` | `UPDATE audit_logs` |
 
-{
-  "equipment_id": 31,
-  "downtime_type": "unplanned",
-  "start_time": "2026-10-20T10:00:00Z",
-  "end_time": "2026-10-20T12:30:00Z",
-  "reason": "Sensör Kalibrasyon Duruşu"
-}
+---
 
-### 18. Denetim Kayıtları (Append-Only Audit Logs - Yalnızca Yönetici)
-GET {{apiUrl}}/audit-logs
-Authorization: Bearer {{token}}
+## 5. Elle doğrulama (API)
+
+### 5.1 VS Code REST Client
+
+`requests.http` dosyasını açın. Üstteki 5 login isteğini sırayla gönderin (token
+değişkenleri dolar), sonra diğer istekleri çalıştırın.
+
+> Problems panelinde `Request 'xxx' has not been sent` uyarıları görebilirsiniz.
+> Bunlar **hata değil**, `Information` seviyesinde bilgi: referans verilen istek o
+> oturumda henüz çalıştırılmamış demek. Bir kez gönderince kaybolur; kalıcı olarak
+> gizlemek için panel filtresini **Errors** yapın.
+
+### 5.2 curl ile kritik akış
+
+```bash
+BASE=http://localhost:8080
+TOKEN=$(curl -s -X POST $BASE/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"yonetici@bakimplan.local","password":"Password123!"}' \
+  | jq -r .access_token)
+
+# İş emri aç (anahtar zorunlu)
+curl -s -X POST $BASE/api/v1/work-orders \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"equipment_id":31,"title":"Test","wo_type":"corrective"}'
+
+# Aynı isteği aynı anahtarla tekrar → X-Idempotent-Replay: true
+```
+
+---
+
+## 6. Sürekli entegrasyon (CI)
+
+`.github/workflows/ci.yml` iki iş koşar:
+
+| İş | Adımlar |
+|---|---|
+| **Backend (Go)** | `golangci-lint v2.15.0` → `go build` → `go test -race ./...` |
+| **Frontend (Vue)** | `npm ci` → `npm run build` → artifact yükleme |
+
+PostgreSQL 16.4 servis olarak tanımlı; `DATABASE_URL` env'i üzerinden bağlanır.
+
+**Neden frontend job'ı var?** Bir dönem backend yeşilken frontend derlenmiyordu (boş `.vue`
+dosyaları). Test edilmeyen şey bozulur; pipeline'ın kapsamı ürünün kapsamına eşitlenmeli.
+
+---
+
+## 7. Bilinen sınırlar
+
+| Konu | Durum |
+|---|---|
+| `make verify` idempotent değil | Aynı DB'de tekrar koşarsan T-2/T-3 düşer → `make reset-demo` |
+| `verify` veriyi değiştirir | Demo DB'sinde çalıştırın; üretimde kullanmayın |
+| Keyset sayfalama | Yalnızca `work-orders`; diğer listeler `LIMIT 100` sabit |
+| 1M satır performansı | Ölçüldü (bkz. README §7); materyalize view henüz kodda değil |
+| Mobil erişim | `VITE_API_URL` yeniden derleme gerektirir (README §9) |
