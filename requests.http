@@ -1,0 +1,548 @@
+################################################################################
+# BakımPlan CMMS — HTTP istek koleksiyonu
+#
+# Kullanım (VS Code "REST Client" eklentisi):
+#   1. `docker compose up --build` çalıştır, sağlıklı olana kadar bekle.
+#   2. Aşağıdaki 5 rol giriş isteğini sırayla gönder → token değişkenleri dolar.
+#   3. Diğer istekleri gönder. Her isteğin üstündeki ### çizgisine tıkla.
+#
+# JetBrains HTTP Client kullanıyorsan: `{{loginYonetici.response.body.$.access_token}}`
+# yerine `> {% client.global.set("yoneticiToken", response.body.access_token) %}` yaz.
+#
+# Demo parolası (5 rolün hepsi): Password123!
+################################################################################
+
+@baseUrl = http://localhost:8080
+@api = {{baseUrl}}/api/v1
+@password = Password123!
+
+# Kaynak kimlikleri — seed sonrası (SEED_VALUE=42) deterministiktir.
+# Farklı bir veritabanında çalıştırıyorsan aşağıdaki değerleri güncelle:
+#   GET /api/v1/equipments/tree  → id
+#   GET /api/v1/parts            → id
+#   GET /api/v1/warehouses       → id
+@tesisId = 1
+@hatId = 6
+@makineId = 31
+@bilesenId = 301
+@partId = 1
+@depoId = 1
+
+
+################################################################################
+# 0. SAĞLIK KONTROLÜ (JWT gerekmez)
+################################################################################
+
+### 0.1 Health — DB bağlantısı dahil
+GET {{baseUrl}}/health
+
+> {%
+client.test("health 200", function() {
+  client.assert(response.status === 200, "beklenen 200, gelen " + response.status);
+  client.assert(response.body.database === "connected", "veritabanı bağlı değil");
+});
+%}
+
+
+################################################################################
+# 1. KİMLİK DOĞRULAMA (Faz 2)
+# Token'lar aşağıdaki isteklerde değişken olarak kullanılır.
+################################################################################
+
+### 1.1 Giriş — yönetici (tam yetki)
+# @name loginYonetici
+POST {{api}}/auth/login
+Content-Type: application/json
+
+{ "email": "yonetici@bakimplan.local", "password": "{{password}}" }
+
+### 1.2 Giriş — planlama
+# @name loginPlanlama
+POST {{api}}/auth/login
+Content-Type: application/json
+
+{ "email": "planlama@bakimplan.local", "password": "{{password}}" }
+
+### 1.3 Giriş — teknisyen
+# @name loginTeknisyen
+POST {{api}}/auth/login
+Content-Type: application/json
+
+{ "email": "teknisyen@bakimplan.local", "password": "{{password}}" }
+
+### 1.4 Giriş — üretim
+# @name loginUretim
+POST {{api}}/auth/login
+Content-Type: application/json
+
+{ "email": "uretim@bakimplan.local", "password": "{{password}}" }
+
+### 1.5 Giriş — depo
+# @name loginDepo
+POST {{api}}/auth/login
+Content-Type: application/json
+
+{ "email": "depo@bakimplan.local", "password": "{{password}}" }
+
+###
+@yoneticiToken  = {{loginYonetici.response.body.$.access_token}}
+@planlamaToken  = {{loginPlanlama.response.body.$.access_token}}
+@teknisyenToken = {{loginTeknisyen.response.body.$.access_token}}
+@uretimToken    = {{loginUretim.response.body.$.access_token}}
+@depoToken      = {{loginDepo.response.body.$.access_token}}
+
+
+### 1.6 Oturum bilgisi (me)
+GET {{api}}/auth/me
+Authorization: Bearer {{yoneticiToken}}
+
+
+################################################################################
+# 2. NEGATİF TESTLER — 401 / 403 (Faz 2 RBAC)
+################################################################################
+
+### 2.1 Token yok → 401 ERR_UNAUTHORIZED
+GET {{api}}/auth/me
+
+> {%
+client.test("tokensız istek 401 dönmeli", function() {
+  client.assert(response.status === 401, "beklenen 401, gelen " + response.status);
+  client.assert(response.body.error.code === "UNAUTHORIZED", "hata kodu UNAUTHORIZED değil");
+});
+%}
+
+### 2.2 Yanlış parola → 401
+POST {{api}}/auth/login
+Content-Type: application/json
+
+{ "email": "yonetici@bakimplan.local", "password": "yanlis-parola" }
+
+### 2.3 Teknisyen → /audit-logs → 403 (yalnızca yönetici)
+GET {{api}}/audit-logs
+Authorization: Bearer {{teknisyenToken}}
+
+> {%
+client.test("yetkisiz rol 403 dönmeli", function() {
+  client.assert(response.status === 403, "beklenen 403, gelen " + response.status);
+});
+%}
+
+### 2.4 Depo → iş emri açma → 403 (planlama/yönetici yetkili)
+POST {{api}}/work-orders
+Authorization: Bearer {{depoToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{ "equipment_id": {{makineId}}, "title": "yetkisiz deneme" }
+
+### 2.5 Teknisyen → ekipman taşıma → 403
+PATCH {{api}}/equipments/{{bilesenId}}/move
+Authorization: Bearer {{teknisyenToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{ "new_parent_id": {{makineId}} }
+
+
+################################################################################
+# 3. F-1 / T-2 — EKİPMAN HİYERARŞİSİ
+# Tesis → Hat → Makine → Bileşen, WITH RECURSIVE roll-up
+################################################################################
+
+### 3.1 Ağaç + roll-up (maliyet ve duruş süresi yukarı toplanır)
+GET {{api}}/equipments/tree
+Authorization: Bearer {{yoneticiToken}}
+
+> {%
+client.test("ağaç dolu dönmeli", function() {
+  client.assert(response.status === 200, "beklenen 200");
+  client.assert(response.body.tree.length > 0, "kök tesis yok");
+  client.assert(typeof response.body.flat_count === "number", "flat_count eksik");
+});
+%}
+
+### 3.2 Yeni ekipman (tesis → hat → makine → bileşen sırası zorunlu)
+POST {{api}}/equipments
+Authorization: Bearer {{yoneticiToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "code": "MAK-TEST-{{$timestamp}}",
+  "name": "Test Makinesi",
+  "level_type": "makine",
+  "parent_id": {{hatId}},
+  "is_critical": false
+}
+
+### 3.3 Hatalı seviye → 422 INVALID_HIERARCHY_LEVEL (makine doğrudan tesis altına bağlanamaz)
+POST {{api}}/equipments
+Authorization: Bearer {{yoneticiToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "code": "MAK-HATALI-{{$timestamp}}",
+  "name": "Hatalı Seviye",
+  "level_type": "makine",
+  "parent_id": {{tesisId}}
+}
+
+### 3.4 Ağaçta taşıma (hat → başka tesis)
+PATCH {{api}}/equipments/{{hatId}}/move
+Authorization: Bearer {{yoneticiToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{ "new_parent_id": {{tesisId}} }
+
+### 3.5 Döngü engeli → 409 CYCLE_DETECTED (makine, kendi alt bileşeninin altına taşınamaz)
+PATCH {{api}}/equipments/{{makineId}}/move
+Authorization: Bearer {{yoneticiToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{ "new_parent_id": {{bilesenId}} }
+
+> {%
+client.test("döngü engellenmeli", function() {
+  client.assert(response.status === 409, "beklenen 409, gelen " + response.status);
+  client.assert(response.body.error.code === "CYCLE_DETECTED", "hata kodu CYCLE_DETECTED değil");
+});
+%}
+
+
+################################################################################
+# 4. T-1 / F-4 — ÖNLEYİCİ BAKIM (süre + sayaç)
+################################################################################
+
+### 4.1 PM planı listesi
+GET {{api}}/preventive-plans
+Authorization: Bearer {{yoneticiToken}}
+
+### 4.2 Süre bazlı plan (calc_basis = planned)
+POST {{api}}/preventive-plans
+Authorization: Bearer {{yoneticiToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "equipment_id": {{makineId}},
+  "name": "Aylık Yağ Değişimi",
+  "plan_type": "time",
+  "interval_days": 30,
+  "calc_basis": "planned"
+}
+
+### 4.3 Sayaç bazlı plan (500 saatte bir)
+POST {{api}}/preventive-plans
+Authorization: Bearer {{yoneticiToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "equipment_id": {{makineId}},
+  "name": "500 Saat Filtre Bakımı",
+  "plan_type": "meter",
+  "interval_hours": 500,
+  "calc_basis": "completed"
+}
+
+### 4.4 Sayaç okuması — eşik aşılırsa idempotent otomatik iş emri üretir
+# Aynı Idempotency-Key ile tekrar gönderilirse yeni iş emri OLUŞMAZ (replay).
+POST {{api}}/equipments/{{makineId}}/meter-readings
+Authorization: Bearer {{teknisyenToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{ "reading_hours": 99999 }
+
+> {%
+client.test("sayaç kaydı 200", function() {
+  client.assert(response.status === 200, "beklenen 200");
+  client.assert(Array.isArray(response.body.generated_work_orders), "generated_work_orders dizi olmalı");
+});
+%}
+
+### 4.5 Vadesi gelen planları tara (geciken bakım birikmez: plan başına en fazla 1 açık iş emri)
+POST {{api}}/preventive-plans/trigger-due
+Authorization: Bearer {{yoneticiToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{}
+
+
+################################################################################
+# 5. F-2 — ARIZA BİLDİRİMİ
+################################################################################
+
+### 5.1 Arıza bildirimleri
+GET {{api}}/failure-reports
+Authorization: Bearer {{uretimToken}}
+
+### 5.2 Arıza bildir (üretim / teknisyen / planlama / yönetici)
+POST {{api}}/failure-reports
+Authorization: Bearer {{uretimToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "equipment_id": {{makineId}},
+  "title": "Ana mil yatağı aşırı ısınıyor",
+  "description": "Vardiya başında 78°C ölçüldü, normal eşik 60°C.",
+  "severity": "yuksek"
+}
+
+
+################################################################################
+# 6. F-3 — İŞ EMİRLERİ (keyset / cursor sayfalama)
+################################################################################
+
+### 6.1 İlk sayfa
+GET {{api}}/work-orders?limit=25
+Authorization: Bearer {{teknisyenToken}}
+
+> {%
+client.test("keyset sayfalama", function() {
+  client.assert(response.status === 200, "beklenen 200");
+  client.assert(Array.isArray(response.body.items), "items dizi olmalı");
+});
+%}
+
+### 6.2 Sonraki sayfa — next_cursor'ı aşağıdaki değerle değiştir
+GET {{api}}/work-orders?limit=25&cursor=5990
+Authorization: Bearer {{teknisyenToken}}
+
+### 6.3 Yeni iş emri (planlama / yönetici)
+# @name createWorkOrder
+POST {{api}}/work-orders
+Authorization: Bearer {{planlamaToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "equipment_id": {{makineId}},
+  "wo_type": "corrective",
+  "priority": "yuksek",
+  "title": "Rulman değişimi",
+  "labor_cost_kurus": 150000
+}
+
+### 6.4 İş emrini tamamla — PM ise sonraki bakım tarihi hesaplanır
+# 6.3'te oluşturulan iş emri kullanılır (id dinamik).
+POST {{api}}/work-orders/{{createWorkOrder.response.body.$.id}}/complete
+Authorization: Bearer {{teknisyenToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{ "labor_cost_kurus": 150000 }
+
+
+################################################################################
+# 7. F-5 / T-3 — YEDEK PARÇA, STOK VE REZERVASYON
+################################################################################
+
+### 7.1 Parçalar — stok = SUM(stock_movements.quantity_change)
+GET {{api}}/parts
+Authorization: Bearer {{depoToken}}
+
+> {%
+client.test("stok hesapları tutarlı", function() {
+  client.assert(response.status === 200, "beklenen 200");
+  const p = response.body.items[0];
+  client.assert(p.physical_stock - p.reserved_stock === p.available_stock,
+    "available != physical - reserved");
+});
+%}
+
+### 7.2 Depolar (stok hareketi ve rezervasyon formları için)
+GET {{api}}/warehouses
+Authorization: Bearer {{depoToken}}
+
+### 7.3 Stok girişi (depo / yönetici)
+POST {{api}}/stock-movements
+Authorization: Bearer {{depoToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "part_id": {{partId}},
+  "warehouse_id": {{depoId}},
+  "quantity_change": 25,
+  "movement_type": "purchase"
+}
+
+### 7.4 Rezervasyon için açık iş emri oluştur (ön koşul)
+# @name woForReserve
+POST {{api}}/work-orders
+Authorization: Bearer {{planlamaToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "equipment_id": {{makineId}},
+  "wo_type": "corrective",
+  "priority": "normal",
+  "title": "Parça rezervasyonu için açılan iş emri"
+}
+
+### 7.5 Parça rezervasyonu — SELECT ... FOR UPDATE ile yarış koruması
+# Stok yetmezse 409 INSUFFICIENT_STOCK, BOM uyumsuzsa 422 BOM_INCOMPATIBLE,
+# iş emri kapalıysa 409 WO_CLOSED döner.
+POST {{api}}/work-orders/{{woForReserve.response.body.$.id}}/reserve-part
+Authorization: Bearer {{depoToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "part_id": {{partId}},
+  "warehouse_id": {{depoId}},
+  "quantity": 2
+}
+
+
+################################################################################
+# 8. F-6 — TEKNİSYEN İŞ YÜKÜ
+################################################################################
+
+### 8.1 Aktif / tamamlanan iş sayısı
+GET {{api}}/technicians/workload
+Authorization: Bearer {{planlamaToken}}
+
+
+################################################################################
+# 9. F-7 / T-4 — GÜVENİLİRLİK (MTBF, MTTR, Availability)
+################################################################################
+
+### 9.1 Tesis geneli, son 30 gün
+GET {{api}}/metrics/reliability?days=30
+Authorization: Bearer {{yoneticiToken}}
+
+> {%
+client.test("metrikler hesaplandı", function() {
+  client.assert(response.status === 200, "beklenen 200");
+  client.assert(response.body.availability_percent <= 100, "availability > 100 olamaz");
+  client.assert(response.body.top_problematic_10.length <= 10, "top 10 en fazla 10 satır");
+});
+%}
+
+### 9.2 Tek ekipman, 90 gün
+GET {{api}}/metrics/reliability?equipment_id={{makineId}}&days=90
+Authorization: Bearer {{yoneticiToken}}
+
+### 9.3 Duruş olayı ekle (teknisyen / planlama / üretim / yönetici)
+# @name createDowntime
+POST {{api}}/downtime-events
+Authorization: Bearer {{teknisyenToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "equipment_id": {{makineId}},
+  "downtime_type": "unplanned",
+  "start_time": "2026-10-20T08:00:00Z",
+  "end_time": "2026-10-20T12:00:00Z",
+  "reason": "Hidrolik basınç kaybı"
+}
+
+### 9.4 Örtüşen ikinci duruş (10:00–14:00) — metrikler birleştirmeli (4+4 → 6 saat)
+POST {{api}}/downtime-events
+Authorization: Bearer {{teknisyenToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "equipment_id": {{makineId}},
+  "downtime_type": "unplanned",
+  "start_time": "2026-10-20T10:00:00Z",
+  "end_time": "2026-10-20T14:00:00Z",
+  "reason": "Ardından gelen ikinci arıza"
+}
+
+### 9.5 Geçmiş duruş olayını düzelt — metrikler anında yeniden hesaplanır
+# 9.3'te oluşturulan olay kullanılır (id dinamik).
+PATCH {{api}}/downtime-events/{{createDowntime.response.body.$.id}}
+Authorization: Bearer {{planlamaToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "equipment_id": {{makineId}},
+  "downtime_type": "unplanned",
+  "start_time": "2026-10-20T08:00:00Z",
+  "end_time": "2026-10-20T11:00:00Z",
+  "reason": "Süre düzeltildi"
+}
+
+
+################################################################################
+# 10. DENETİM KAYDI (append-only)
+################################################################################
+
+### 10.1 Son 100 denetim kaydı (yalnızca yönetici)
+GET {{api}}/audit-logs
+Authorization: Bearer {{yoneticiToken}}
+
+> {%
+client.test("audit kayıtları", function() {
+  client.assert(response.status === 200, "beklenen 200");
+  client.assert(Array.isArray(response.body.items), "items dizi olmalı");
+});
+%}
+
+
+################################################################################
+# 11. IDEMPOTENCY DAVRANIŞI (Faz 2)
+################################################################################
+
+### 11.1 İlk istek — yeni kayıt
+POST {{api}}/failure-reports
+Authorization: Bearer {{uretimToken}}
+Content-Type: application/json
+Idempotency-Key: demo-idem-001
+
+{
+  "equipment_id": {{makineId}},
+  "title": "Idempotency demo",
+  "description": "Aynı anahtarla ikinci kez gönderilecek.",
+  "severity": "orta"
+}
+
+### 11.2 Aynı anahtar + aynı gövde → aynı yanıt, X-Idempotent-Replay: true
+POST {{api}}/failure-reports
+Authorization: Bearer {{uretimToken}}
+Content-Type: application/json
+Idempotency-Key: demo-idem-001
+
+{
+  "equipment_id": {{makineId}},
+  "title": "Idempotency demo",
+  "description": "Aynı anahtarla ikinci kez gönderilecek.",
+  "severity": "orta"
+}
+
+> {%
+client.test("replay işaretlenmeli", function() {
+  client.assert(response.status === 201, "beklenen 201 (kayıtlı yanıt)");
+  client.assert(response.headers["X-Idempotent-Replay"] === "true", "X-Idempotent-Replay başlığı yok");
+});
+%}
+
+### 11.3 Aynı anahtar + farklı gövde → 409 IDEMPOTENCY_CONFLICT
+POST {{api}}/failure-reports
+Authorization: Bearer {{uretimToken}}
+Content-Type: application/json
+Idempotency-Key: demo-idem-001
+
+{
+  "equipment_id": {{makineId}},
+  "title": "Farklı gövde",
+  "severity": "kritik"
+}
+
+> {%
+client.test("gövde çakışması 409", function() {
+  client.assert(response.status === 409, "beklenen 409, gelen " + response.status);
+});
+%}

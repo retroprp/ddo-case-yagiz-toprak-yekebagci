@@ -50,9 +50,6 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-      args:
-        # Tarayıcının erişeceği API adresi. Varsayılan, tek komutla çalışan kurulumla aynıdır.
-        VITE_API_URL: ${VITE_API_URL:-http://localhost:8080/api/v1}
     ports:
       - "3000:8080"
     depends_on:
@@ -73,6 +70,17 @@ services:
     environment:
       API_URL: http://backend:8080
       DATABASE_URL: ${DATABASE_URL:-postgres://cmms_user:cmms_secret_pass@db:5432/bakimplan_db?sslmode=disable}
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  k6:
+    image: grafana/k6:0.54.0
+    profiles: ["load"]
+    environment:
+      API_URL: http://backend:8080
+    volumes:
+      - ./loadtest:/scripts:ro
     depends_on:
       backend:
         condition: service_healthy
