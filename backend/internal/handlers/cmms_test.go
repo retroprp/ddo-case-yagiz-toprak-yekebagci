@@ -213,6 +213,7 @@ func setupIntegrationRouter(t *testing.T) (*pgxpool.Pool, http.Handler) {
 		api.Post("/auth/login", authH.Login)
 		api.Group(func(p chi.Router) {
 			p.Use(auth.Authenticate)
+			p.Use(appmw.RequireIdempotencyKey())
 			p.Use(appmw.Idempotency(pool, extractUserID))
 			p.Use(appmw.AuditTrail(pool, extractUserID))
 
@@ -255,11 +256,34 @@ func doTestReq(r http.Handler, method, path, token string, body any, headers map
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
+	// Gerçek istemci davranışı: değiştirici isteklerde anahtar yoksa üret.
+	// Kritik uçlar Idempotency-Key olmadan 400 IDEMPOTENCY_KEY_REQUIRED döner.
+	if needsIdempotencyKey(method) && req.Header.Get("Idempotency-Key") == "" {
+		req.Header.Set("Idempotency-Key", newTestIdempotencyKey())
+	}
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	var out map[string]any
 	_ = json.NewDecoder(rec.Body).Decode(&out)
 	return rec, out
+}
+
+// needsIdempotencyKey, değiştirici HTTP metotlarını bildirir.
+func needsIdempotencyKey(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+// testIdemCounter, aynı nanosaniyede üretilen anahtarların çakışmasını engeller.
+// (Çakışırsa ikinci istek idempotent "replay" olur ve eşzamanlılık sayaçlarını yanıltır.)
+var testIdemCounter uint64
+
+func newTestIdempotencyKey() string {
+	return fmt.Sprintf("test-%d-%d", time.Now().UnixNano(), atomic.AddUint64(&testIdemCounter, 1))
 }
 
 func TestIntegration01_SeedAndLoginAll5Roles(t *testing.T) {

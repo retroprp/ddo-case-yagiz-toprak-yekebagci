@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -24,6 +25,64 @@ const (
 	// maxIdempotencyKey: DB kolonu VARCHAR(255).
 	maxIdempotencyKey = 255
 )
+
+// criticalIdempotencyRoutes, Idempotency-Key başlığı ZORUNLU olan uçlardır.
+//
+// Anahtar, chi'nin route pattern'i ile eşleşir ("POST /api/v1/work-orders").
+// RoutePattern kullanılıyor çünkü gerçek yol parametre içerir
+// (/work-orders/42/complete) ve onu sabit listeyle eşleştirmek mümkün değildir.
+//
+// Liste bilinçli olarak açık: yeni bir uç eklendiğinde buraya yazılmadıkça
+// anahtar zorunlu olmaz. Böylece kapsam gözden geçirilebilir kalır.
+var criticalIdempotencyRoutes = map[string]bool{
+	"POST /api/v1/equipments":                     true,
+	"PATCH /api/v1/equipments/{id}/move":          true,
+	"POST /api/v1/equipments/{id}/meter-readings": true,
+
+	"POST /api/v1/failure-reports": true,
+
+	"POST /api/v1/work-orders":                   true,
+	"POST /api/v1/work-orders/{id}/complete":     true,
+	"PATCH /api/v1/work-orders/{id}/status":      true,
+	"POST /api/v1/work-orders/{id}/assign":       true,
+	"DELETE /api/v1/work-orders/{id}/assign":     true,
+	"POST /api/v1/work-orders/{id}/reserve-part": true,
+
+	"POST /api/v1/stock-movements": true,
+
+	"POST /api/v1/preventive-plans":             true,
+	"POST /api/v1/preventive-plans/trigger-due": true,
+
+	"POST /api/v1/downtime-events":       true,
+	"PATCH /api/v1/downtime-events/{id}": true,
+}
+
+// RequireIdempotencyKey, kritik uçlarda Idempotency-Key başlığını zorunlu kılar.
+//
+// Neden ayrı bir middleware: Idempotency middleware'i anahtar yoksa isteği
+// normal işler (tekrar oynatma koruması devre dışı kalır). Bu katman, korumanın
+// sessizce atlanmasını engeller ve istemciye açık bir hata döner.
+//
+// auth.Authenticate'ten SONRA, Idempotency'den ÖNCE bağlanmalıdır.
+func RequireIdempotencyKey() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			pattern := chi.RouteContext(r.Context()).RoutePattern()
+			if !criticalIdempotencyRoutes[r.Method+" "+pattern] {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			if strings.TrimSpace(r.Header.Get("Idempotency-Key")) == "" {
+				WriteError(w, http.StatusBadRequest, "IDEMPOTENCY_KEY_REQUIRED",
+					"Bu uç için Idempotency-Key başlığı zorunludur (tekrar gönderimde çift kayıt oluşmasını engeller).")
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
 
 // UserIDFunc isteğin sahibini döndürür. Nil dönerse anonim (user_id=0) sayılır.
 //

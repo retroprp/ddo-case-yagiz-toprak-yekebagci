@@ -96,6 +96,7 @@ func main() {
 		api.Group(func(protected chi.Router) {
 			// Önce JWT doğrulanır, ardından kullanıcıya izole Idempotency ve Otomatik Audit Log çalışır!
 			protected.Use(auth.Authenticate)
+			protected.Use(appmw.RequireIdempotencyKey())
 			protected.Use(appmw.Idempotency(pool, extractUserID))
 			protected.Use(appmw.AuditTrail(pool, extractUserID))
 

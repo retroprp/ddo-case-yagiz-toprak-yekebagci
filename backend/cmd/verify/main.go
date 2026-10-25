@@ -400,8 +400,10 @@ func login(email, password string) (string, error) {
 	return tok, nil
 }
 
-func doReq(method, path, token string, payload any, extraHeaders map[string]string) (int, map[string]any, error) {
-	var bodyReader io.Reader
+// verifyIdemCounter, eşzamanlı isteklerde anahtar çakışmasını engeller.
+var verifyIdemCounter uint64
+
+func doReq(method, path, token string, payload any, extraHeaders map[string]string) (int, map[string]any, error) {	var bodyReader io.Reader
 	if payload != nil {
 		b, _ := json.Marshal(payload)
 		bodyReader = bytes.NewReader(b)
@@ -416,6 +418,13 @@ func doReq(method, path, token string, payload any, extraHeaders map[string]stri
 	}
 	for k, v := range extraHeaders {
 		req.Header.Set(k, v)
+	}
+	// Kritik uçlar Idempotency-Key olmadan 400 döner; gerçek istemci gibi
+	// değiştirici isteklerde anahtar yoksa üret. Sayaç, eşzamanlı isteklerde
+	// anahtar çakışmasını (yanlışlıkla idempotent replay) engeller.
+	if method != http.MethodGet && req.Header.Get("Idempotency-Key") == "" {
+		req.Header.Set("Idempotency-Key",
+			fmt.Sprintf("verify-%d-%d", time.Now().UnixNano(), atomic.AddUint64(&verifyIdemCounter, 1)))
 	}
 
 	resp, err := client.Do(req)
