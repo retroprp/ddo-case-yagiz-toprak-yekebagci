@@ -2,12 +2,13 @@ name: BakımPlan CI — Build, Test, Lint & Verify
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
 
 jobs:
   backend-ci:
+    name: Backend (Go)
     runs-on: ubuntu-latest
 
     services:
@@ -36,22 +37,46 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum
 
-      - name: Install and Run golangci-lint
+      - name: Run Go Vet & Static Analysis (golangci-lint built with Go 1.26)
         working-directory: backend
         run: |
-          go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.5
+          go vet ./...
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
           golangci-lint run --timeout=3m ./...
 
-      - name: Build Backend, Simulator & Verify binaries
+      - name: Build API, Simulator & Verify binaries
         working-directory: backend
         run: |
           go build -v ./cmd/api
           go build -v ./cmd/simulator
           go build -v ./cmd/verify
 
-      - name: Run 30 Unit & PostgreSQL Integration Tests (with Race Detector)
+      - name: Run unit & PostgreSQL integration tests (race detector)
         working-directory: backend
         run: go test -v -race ./...
+
+  frontend-ci:
+    name: Frontend (Vue)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.18"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: Build production bundle
+        working-directory: frontend
+        run: npm run build
