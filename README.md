@@ -49,7 +49,10 @@ curl http://localhost:8080/health
 ## 2. Demo Kullanıcılar
 
 Tüm hesapların parolası: **`Password123!`**
-Arayüzün üst barındaki **"Hızlı Rol Geçişi"** butonlarıyla tek tıkla rol değiştirilebilir.
+
+Giriş ekranındaki **"Demo Hesaplar"** listesine tıklamak yalnızca formu doldurur; girişi
+siz başlatırsınız. Rol değiştirmek için **Çıkış** yapıp diğer hesapla giriş yapın —
+oturum sırasında rol değiştirilemez.
 
 | Rol kodu | E-posta | Yetki kapsamı |
 |---|---|---|

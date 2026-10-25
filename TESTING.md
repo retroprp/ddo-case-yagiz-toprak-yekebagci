@@ -175,7 +175,7 @@ Her gereksinim en az bir otomatik teste bağlıdır:
 | T-2 | Ağaç + cycle | ✅ | `Integration04-06` | ağaçta taşıma |
 | T-3 | Yarış koşulu | ✅ | `Integration07` | rezervasyon formu |
 | T-4 | Interval merge | ✅ | `Unit05-09`, `Integration13` | metrik ekranı |
-| — | Auth / RBAC | ✅ | `Unit01-04,14`, `Integration01` | rol geçişi |
+| — | Auth / RBAC | ✅ | `Unit01-04,14`, `Integration01` | çıkış → başka rolle giriş |
 | — | Idempotency | ✅ | `TestIdemKey01-04` | aynı isteği tekrar |
 | — | Audit append-only | — | `Integration16` | `UPDATE audit_logs` |
 

@@ -109,7 +109,7 @@ CREATE UNIQUE INDEX uq_active_pm_work_order
 **Seçenekler.**
 
 1. **Go `html/template` + HTMX.** Sunucu taraflı; SPA deneyimi ve zengin istemci durumu
-   (rol geçişi, anlık filtre) için ek efor gerekir.
+   (oturum bazlı görünüm, anlık filtre) için ek efor gerekir.
 2. **Vue 3 `<script setup>` + Vite + Tailwind.** Kurumun teknoloji yığınıyla uyumlu, düşük
    boilerplate, multi-stage Nginx ile küçük imaj.
 
