@@ -129,7 +129,6 @@ func TestUnit10_EffectiveShiftHours_InsideShift(t *testing.T) {
 }
 
 func TestUnit11_EffectiveShiftHours_ExcludeOffShiftNight(t *testing.T) {
-	// 04:00 - 10:00 arası (08:00'de başlayan vardiyada yalnızca 08:00-10:00 arası 2 saat sayılmalı!)
 	st := time.Date(2026, 10, 10, 4, 0, 0, 0, time.UTC)
 	et := time.Date(2026, 10, 10, 10, 0, 0, 0, time.UTC)
 	if h := handlers.EffectiveShiftHours(st, et, 16); h != 2.0 {
@@ -176,7 +175,9 @@ func TestUnit14_RBACMiddlewareBlocksUnauthorizedRole(t *testing.T) {
 	}
 }
 
-// POSTGRESQL ENTEGRASYON TESTİ
+// ============================================================================
+// BÖLÜM 2: 16 ADET GERÇEK POSTGRESQL ENTEGRASYON TESTİ (F-1..F-7 & T-1..T-4)
+// ============================================================================
 
 func setupIntegrationRouter(t *testing.T) (*pgxpool.Pool, http.Handler) {
 	t.Helper()
@@ -193,9 +194,15 @@ func setupIntegrationRouter(t *testing.T) (*pgxpool.Pool, http.Handler) {
 	}
 	_ = handlers.SeedDefaultUsers(ctx, pool)
 
-	r := chi.NewRouter()
-	r.Use(appmw.Idempotency(pool))
+	extractUserID := func(r *http.Request) *int {
+		if claims, ok := auth.GetUserFromContext(r.Context()); ok && claims != nil {
+			uid := claims.UserID
+			return &uid
+		}
+		return nil
+	}
 
+	r := chi.NewRouter()
 	authH := handlers.NewAuthHandler(pool)
 	eqH := handlers.NewEquipmentHandler(pool)
 	invH := handlers.NewInventoryHandler(pool)
@@ -206,6 +213,9 @@ func setupIntegrationRouter(t *testing.T) (*pgxpool.Pool, http.Handler) {
 		api.Post("/auth/login", authH.Login)
 		api.Group(func(p chi.Router) {
 			p.Use(auth.Authenticate)
+			p.Use(appmw.Idempotency(pool, extractUserID))
+			p.Use(appmw.AuditTrail(pool, extractUserID))
+
 			p.Get("/auth/me", authH.Me)
 			p.Get("/equipments/tree", eqH.GetTree)
 			p.Post("/equipments", eqH.Create)
@@ -266,16 +276,14 @@ func TestIntegration01_SeedAndLoginAll5Roles(t *testing.T) {
 }
 
 func TestIntegration02_IdempotencyKeyReplay(t *testing.T) {
-	_, router := setupIntegrationRouter(t)
+	pool, router := setupIntegrationRouter(t)
 	tok, _ := auth.GenerateToken(1, "yonetici@bakimplan.local", "Admin", "yonetici")
 
-	// Önce 1 ekipman olduğundan emin olalım
 	_, _ = doTestReq(router, "POST", "/api/v1/equipments", tok, map[string]any{
-		"code": fmt.Sprintf("EQ-IDEM-%d", time.Now().UnixNano()), "name": "Idem Makine", "level_type": "tesis",
+		"code": fmt.Sprintf("EQ-IDEM-%d", time.Now().UnixNano()), "name": "Idem Tesis", "level_type": "tesis",
 	}, nil)
 
 	var firstEqID int
-	pool, _ := setupIntegrationRouter(t)
 	_ = pool.QueryRow(context.Background(), `SELECT id FROM equipments ORDER BY id ASC LIMIT 1`).Scan(&firstEqID)
 
 	key := fmt.Sprintf("idem-test-%d", time.Now().UnixNano())
@@ -289,7 +297,44 @@ func TestIntegration02_IdempotencyKeyReplay(t *testing.T) {
 	}
 }
 
-func TestIntegration03_EquipmentHierarchyAndCyclePrevention_Task2(t *testing.T) {
+func TestIntegration03_IdempotencyCrossUserAndPathIsolation(t *testing.T) {
+	pool, router := setupIntegrationRouter(t)
+	tokUser1, _ := auth.GenerateToken(1, "yonetici@bakimplan.local", "Admin", "yonetici")
+	tokUser2, _ := auth.GenerateToken(2, "planlama@bakimplan.local", "Plan", "planlama")
+
+	var firstEqID int
+	_ = pool.QueryRow(context.Background(), `SELECT id FROM equipments ORDER BY id ASC LIMIT 1`).Scan(&firstEqID)
+	if firstEqID == 0 {
+		_, eqOut := doTestReq(router, "POST", "/api/v1/equipments", tokUser1, map[string]any{
+			"code": fmt.Sprintf("EQ-ISO-%d", time.Now().UnixNano()), "name": "Iso Tesis", "level_type": "tesis",
+		}, nil)
+		firstEqID = int(eqOut["id"].(float64))
+	}
+
+	key := fmt.Sprintf("idem-sec-%d", time.Now().UnixNano())
+	payload := map[string]any{"equipment_id": firstEqID, "title": "User1 İsteği", "severity": "orta"}
+
+	rec1, _ := doTestReq(router, "POST", "/api/v1/failure-reports", tokUser1, payload, map[string]string{"Idempotency-Key": key})
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on first request, got %d", rec1.Code)
+	}
+
+	// Farklı kullanıcı aynı Idempotency-Key ile istek atarsa 409 IDEMPOTENCY_USER_MISMATCH dönmeli!
+	recCrossUser, _ := doTestReq(router, "POST", "/api/v1/failure-reports", tokUser2, payload, map[string]string{"Idempotency-Key": key})
+	if recCrossUser.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for cross-user idempotency key reuse, got %d", recCrossUser.Code)
+	}
+
+	// Aynı kullanıcı aynı anahtarı farklı bir endpoint (/work-orders) için kullanırsa 409 IDEMPOTENCY_KEY_CONFLICT dönmeli!
+	recCrossPath, _ := doTestReq(router, "POST", "/api/v1/work-orders", tokUser1, map[string]any{
+		"equipment_id": firstEqID, "title": "Farklı Endpoint",
+	}, map[string]string{"Idempotency-Key": key})
+	if recCrossPath.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for cross-path idempotency key reuse, got %d", recCrossPath.Code)
+	}
+}
+
+func TestIntegration04_EquipmentHierarchyAndCyclePrevention_Task2(t *testing.T) {
 	_, router := setupIntegrationRouter(t)
 	tok, _ := auth.GenerateToken(1, "planlama@bakimplan.local", "Plan", "planlama")
 	suffix := time.Now().UnixNano()
@@ -304,7 +349,6 @@ func TestIntegration03_EquipmentHierarchyAndCyclePrevention_Task2(t *testing.T) 
 	}, nil)
 	childID := int(cOut["id"].(float64))
 
-	// Üst düğümü (parentID) kendi alt düğümünün (childID) altına taşımak 409 CYCLE_DETECTED dönmeli!
 	recCycle, _ := doTestReq(router, "PATCH", fmt.Sprintf("/api/v1/equipments/%d/move", parentID), tok, map[string]any{
 		"new_parent_id": childID,
 	}, nil)
@@ -313,44 +357,67 @@ func TestIntegration03_EquipmentHierarchyAndCyclePrevention_Task2(t *testing.T) 
 	}
 }
 
-func TestIntegration04_EquipmentRollupCosts_Task2(t *testing.T) {
+func TestIntegration05_EquipmentInvalidHierarchyLevelRejection_Task2(t *testing.T) {
 	_, router := setupIntegrationRouter(t)
 	tok, _ := auth.GenerateToken(1, "planlama@bakimplan.local", "Plan", "planlama")
 	suffix := time.Now().UnixNano()
 
-	_, pOut := doTestReq(router, "POST", "/api/v1/equipments", tok, map[string]any{
+	_, tOut := doTestReq(router, "POST", "/api/v1/equipments", tok, map[string]any{
+		"code": fmt.Sprintf("TES-HL-%d", suffix), "name": "Tesis HL", "level_type": "tesis",
+	}, nil)
+	tesisID := int(tOut["id"].(float64))
+
+	// 'makine' doğrudan 'tesis' altına bağlanamaz ('hat' altına bağlanmalıdır) -> 422 dönmeli!
+	recInvalid, _ := doTestReq(router, "POST", "/api/v1/equipments", tok, map[string]any{
+		"code": fmt.Sprintf("MAK-HL-%d", suffix), "name": "Hatalı Makine", "level_type": "makine", "parent_id": tesisID,
+	}, nil)
+	if recInvalid.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 INVALID_HIERARCHY_LEVEL when attaching makine directly to tesis, got %d", recInvalid.Code)
+	}
+}
+
+func TestIntegration06_EquipmentRollupCosts_Task2(t *testing.T) {
+	_, router := setupIntegrationRouter(t)
+	tok, _ := auth.GenerateToken(1, "planlama@bakimplan.local", "Plan", "planlama")
+	suffix := time.Now().UnixNano()
+
+	_, tOut := doTestReq(router, "POST", "/api/v1/equipments", tok, map[string]any{
 		"code": fmt.Sprintf("TES-ROLL-%d", suffix), "name": "Rollup Tesis", "level_type": "tesis",
 	}, nil)
-	parentID := int(pOut["id"].(float64))
+	tesisID := int(tOut["id"].(float64))
 
-	_, cOut := doTestReq(router, "POST", "/api/v1/equipments", tok, map[string]any{
-		"code": fmt.Sprintf("MAK-ROLL-%d", suffix), "name": "Rollup Makine", "level_type": "makine", "parent_id": parentID,
+	_, hOut := doTestReq(router, "POST", "/api/v1/equipments", tok, map[string]any{
+		"code": fmt.Sprintf("HAT-ROLL-%d", suffix), "name": "Rollup Hat", "level_type": "hat", "parent_id": tesisID,
 	}, nil)
-	childID := int(cOut["id"].(float64))
+	hatID := int(hOut["id"].(float64))
+
+	_, mOut := doTestReq(router, "POST", "/api/v1/equipments", tok, map[string]any{
+		"code": fmt.Sprintf("MAK-ROLL-%d", suffix), "name": "Rollup Makine", "level_type": "makine", "parent_id": hatID,
+	}, nil)
+	makID := int(mOut["id"].(float64))
 
 	_, _ = doTestReq(router, "POST", "/api/v1/work-orders", tok, map[string]any{
-		"equipment_id": childID, "title": "Alt Maliyet", "labor_cost_kurus": 125000,
+		"equipment_id": makID, "title": "Alt Maliyet", "labor_cost_kurus": 125000,
 	}, nil)
 
 	recTree, treeOut := doTestReq(router, "GET", "/api/v1/equipments/tree", tok, nil, nil)
-	if recTree.Code != http.StatusOK || treeOut["tree"] == nil {
+	if recTree.Code != http.StatusOK || treeOut["tree"] == nil || treeOut["flat_count"] == nil {
 		t.Fatalf("tree query failed: %d", recTree.Code)
 	}
 }
 
-func TestIntegration05_ConcurrentPartReservationRaceCondition_Task3(t *testing.T) {
+func TestIntegration07_ConcurrentPartReservationRaceCondition_Task3(t *testing.T) {
 	pool, router := setupIntegrationRouter(t)
 	tok, _ := auth.GenerateToken(1, "yonetici@bakimplan.local", "Admin", "yonetici")
 	ctx := context.Background()
 	suffix := time.Now().UnixNano()
 
 	var eqID, whID, partID int
-	_ = pool.QueryRow(ctx, `INSERT INTO equipments (code, name, level_type) VALUES ($1, 'Race Eq', 'makine') RETURNING id`, fmt.Sprintf("EQ-RC-%d", suffix)).Scan(&eqID)
+	_ = pool.QueryRow(ctx, `INSERT INTO equipments (code, name, level_type) VALUES ($1, 'Race Eq', 'tesis') RETURNING id`, fmt.Sprintf("EQ-RC-%d", suffix)).Scan(&eqID)
 	_ = pool.QueryRow(ctx, `INSERT INTO warehouses (code, name) VALUES ($1, 'Race Depo') RETURNING id`, fmt.Sprintf("WH-RC-%d", suffix)).Scan(&whID)
 	_ = pool.QueryRow(ctx, `INSERT INTO parts (sku, name, unit_cost_kurus, reorder_point, is_critical) VALUES ($1, 'Race Rulman', 10000, 2, true) RETURNING id`, fmt.Sprintf("SKU-RC-%d", suffix)).Scan(&partID)
 	_, _ = pool.Exec(ctx, `INSERT INTO equipment_parts_bom (equipment_id, part_id) VALUES ($1, $2)`, eqID, partID)
 
-	// Stokta tam olarak 4 adet parça olsun
 	_, _ = doTestReq(router, "POST", "/api/v1/stock-movements", tok, map[string]any{
 		"part_id": partID, "warehouse_id": whID, "quantity_change": 4, "movement_type": "purchase",
 	}, nil)
@@ -360,7 +427,6 @@ func TestIntegration05_ConcurrentPartReservationRaceCondition_Task3(t *testing.T
 	}, nil)
 	woID := int64(woOut["id"].(float64))
 
-	// 20 Eşzamanlı goroutine aynı anda 1'er adet rezerve etmeye çalışsın -> Tam 4 tanesi 201 almalı, 16 tanesi 409 almalı!
 	var wg sync.WaitGroup
 	var okCount, conflictCount int32
 	for i := 0; i < 20; i++ {
@@ -370,9 +436,10 @@ func TestIntegration05_ConcurrentPartReservationRaceCondition_Task3(t *testing.T
 			rec, _ := doTestReq(router, "POST", fmt.Sprintf("/api/v1/work-orders/%d/reserve-part", woID), tok, map[string]any{
 				"part_id": partID, "warehouse_id": whID, "quantity": 1,
 			}, nil)
-			if rec.Code == http.StatusCreated {
+			switch rec.Code {
+			case http.StatusCreated:
 				atomic.AddInt32(&okCount, 1)
-			} else if rec.Code == http.StatusConflict {
+			case http.StatusConflict:
 				atomic.AddInt32(&conflictCount, 1)
 			}
 		}()
@@ -384,26 +451,60 @@ func TestIntegration05_ConcurrentPartReservationRaceCondition_Task3(t *testing.T
 	}
 }
 
-func TestIntegration06_BOMIncompatibilityRejection_Task3(t *testing.T) {
+func TestIntegration08_WorkOrderCompletionConsumesReservedStock_Task3(t *testing.T) {
+	pool, router := setupIntegrationRouter(t)
+	tok, _ := auth.GenerateToken(1, "yonetici@bakimplan.local", "Admin", "yonetici")
+	ctx := context.Background()
+	suffix := time.Now().UnixNano()
+
+	var eqID, whID, partID int
+	_ = pool.QueryRow(ctx, `INSERT INTO equipments (code, name, level_type) VALUES ($1, 'Consume Eq', 'tesis') RETURNING id`, fmt.Sprintf("EQ-CS-%d", suffix)).Scan(&eqID)
+	_ = pool.QueryRow(ctx, `INSERT INTO warehouses (code, name) VALUES ($1, 'Consume Depo') RETURNING id`, fmt.Sprintf("WH-CS-%d", suffix)).Scan(&whID)
+	_ = pool.QueryRow(ctx, `INSERT INTO parts (sku, name, unit_cost_kurus) VALUES ($1, 'Consume Parça', 5000) RETURNING id`, fmt.Sprintf("SKU-CS-%d", suffix)).Scan(&partID)
+	_, _ = pool.Exec(ctx, `INSERT INTO equipment_parts_bom (equipment_id, part_id) VALUES ($1, $2)`, eqID, partID)
+
+	_, _ = doTestReq(router, "POST", "/api/v1/stock-movements", tok, map[string]any{
+		"part_id": partID, "warehouse_id": whID, "quantity_change": 10, "movement_type": "purchase",
+	}, nil)
+
+	_, woOut := doTestReq(router, "POST", "/api/v1/work-orders", tok, map[string]any{"equipment_id": eqID, "title": "Consume WO"}, nil)
+	woID := int64(woOut["id"].(float64))
+
+	_, _ = doTestReq(router, "POST", fmt.Sprintf("/api/v1/work-orders/%d/reserve-part", woID), tok, map[string]any{
+		"part_id": partID, "warehouse_id": whID, "quantity": 3,
+	}, nil)
+
+	// İş emri tamamlandığında 3 adet rezerve parça fiziksel stoktan (-3) düşmeli ve fiziksel stok 7 olmalı!
+	recComp, _ := doTestReq(router, "POST", fmt.Sprintf("/api/v1/work-orders/%d/complete", woID), tok, map[string]any{}, nil)
+	if recComp.Code != http.StatusOK {
+		t.Fatalf("complete wo failed: %d", recComp.Code)
+	}
+
+	var physicalAfter int
+	_ = pool.QueryRow(ctx, `SELECT COALESCE(SUM(quantity_change), 0) FROM stock_movements WHERE part_id = $1 AND warehouse_id = $2`, partID, whID).Scan(&physicalAfter)
+	if physicalAfter != 7 {
+		t.Fatalf("expected physical stock=7 after consuming 3 from 10, got %d", physicalAfter)
+	}
+}
+
+func TestIntegration09_BOMIncompatibilityRejection_Task3(t *testing.T) {
 	pool, router := setupIntegrationRouter(t)
 	tok, _ := auth.GenerateToken(1, "yonetici@bakimplan.local", "Admin", "yonetici")
 	ctx := context.Background()
 	suffix := time.Now().UnixNano()
 
 	var eqID, whID, p1, p2 int
-	_ = pool.QueryRow(ctx, `INSERT INTO equipments (code, name, level_type) VALUES ($1, 'BOM Eq', 'makine') RETURNING id`, fmt.Sprintf("EQ-BOM-%d", suffix)).Scan(&eqID)
+	_ = pool.QueryRow(ctx, `INSERT INTO equipments (code, name, level_type) VALUES ($1, 'BOM Eq', 'tesis') RETURNING id`, fmt.Sprintf("EQ-BOM-%d", suffix)).Scan(&eqID)
 	_ = pool.QueryRow(ctx, `INSERT INTO warehouses (code, name) VALUES ($1, 'BOM WH') RETURNING id`, fmt.Sprintf("WH-BOM-%d", suffix)).Scan(&whID)
 	_ = pool.QueryRow(ctx, `INSERT INTO parts (sku, name, unit_cost_kurus) VALUES ($1, 'Uyumlu Parça', 5000) RETURNING id`, fmt.Sprintf("P1-%d", suffix)).Scan(&p1)
 	_ = pool.QueryRow(ctx, `INSERT INTO parts (sku, name, unit_cost_kurus) VALUES ($1, 'Uyumsuz Parça', 5000) RETURNING id`, fmt.Sprintf("P2-%d", suffix)).Scan(&p2)
 
-	// Ekipmana sadece p1 uyumlu olarak tanımlansın
 	_, _ = pool.Exec(ctx, `INSERT INTO equipment_parts_bom (equipment_id, part_id) VALUES ($1, $2)`, eqID, p1)
 	_, _ = pool.Exec(ctx, `INSERT INTO stock_movements (part_id, warehouse_id, quantity_change, movement_type) VALUES ($1, $2, 10, 'initial_seed')`, p2, whID)
 
 	_, woOut := doTestReq(router, "POST", "/api/v1/work-orders", tok, map[string]any{"equipment_id": eqID, "title": "BOM Test"}, nil)
 	woID := int64(woOut["id"].(float64))
 
-	// Uyumsuz p2 parçasını rezerve etmeye çalışmak 422 BOM_INCOMPATIBLE dönmeli!
 	rec, _ := doTestReq(router, "POST", fmt.Sprintf("/api/v1/work-orders/%d/reserve-part", woID), tok, map[string]any{
 		"part_id": p2, "warehouse_id": whID, "quantity": 1,
 	}, nil)
@@ -412,42 +513,46 @@ func TestIntegration06_BOMIncompatibilityRejection_Task3(t *testing.T) {
 	}
 }
 
-func TestIntegration07_PreventiveMaintenanceMeterAndNoBacklog_Task1(t *testing.T) {
+func TestIntegration10_PreventiveMaintenanceMeterAndNoBacklog_Task1(t *testing.T) {
 	pool, router := setupIntegrationRouter(t)
 	tok, _ := auth.GenerateToken(1, "planlama@bakimplan.local", "Plan", "planlama")
 	ctx := context.Background()
 	suffix := time.Now().UnixNano()
 
 	var eqID int
-	_ = pool.QueryRow(ctx, `INSERT INTO equipments (code, name, level_type) VALUES ($1, 'PM Eq', 'makine') RETURNING id`, fmt.Sprintf("EQ-PM-%d", suffix)).Scan(&eqID)
+	_ = pool.QueryRow(ctx, `INSERT INTO equipments (code, name, level_type) VALUES ($1, 'PM Eq', 'tesis') RETURNING id`, fmt.Sprintf("EQ-PM-%d", suffix)).Scan(&eqID)
 
 	_, _ = doTestReq(router, "POST", "/api/v1/preventive-plans", tok, map[string]any{
 		"equipment_id": eqID, "name": "500s Bakım", "plan_type": "meter", "interval_hours": 500, "next_due_meter": 500,
 	}, nil)
 
-	// 520 saat okuması -> 1 iş emri üretmeli
 	_, out1 := doTestReq(router, "POST", fmt.Sprintf("/api/v1/equipments/%d/meter-readings", eqID), tok, map[string]any{"reading_hours": 520}, nil)
 	gen1 := out1["generated_work_orders"].([]any)
 	if len(gen1) != 1 {
 		t.Fatalf("expected 1 generated work order, got %d", len(gen1))
 	}
 
-	// İlk iş emri henüz açıkken 1200 saat okuması gelse dahi geciken iş emirleri birikmemeli (0 yeni iş emri)!
 	_, out2 := doTestReq(router, "POST", fmt.Sprintf("/api/v1/equipments/%d/meter-readings", eqID), tok, map[string]any{"reading_hours": 1200}, nil)
 	gen2 := out2["generated_work_orders"].([]any)
 	if len(gen2) != 0 {
 		t.Fatalf("expected 0 backlog work orders while active one exists, got %d", len(gen2))
 	}
+
+	// Sayaç geriye gidemez (1200 sonrası 800 gönderilirse 400 METER_ROLLBACK dönmeli!)
+	recRollback, _ := doTestReq(router, "POST", fmt.Sprintf("/api/v1/equipments/%d/meter-readings", eqID), tok, map[string]any{"reading_hours": 800}, nil)
+	if recRollback.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 METER_ROLLBACK on decreasing meter reading, got %d", recRollback.Code)
+	}
 }
 
-func TestIntegration08_PMCalcBasisPlannedVsCompleted_Task1(t *testing.T) {
+func TestIntegration11_PMCalcBasisPlannedVsCompleted_Task1(t *testing.T) {
 	pool, router := setupIntegrationRouter(t)
 	tok, _ := auth.GenerateToken(1, "planlama@bakimplan.local", "Plan", "planlama")
 	ctx := context.Background()
 	suffix := time.Now().UnixNano()
 
 	var eqID int
-	_ = pool.QueryRow(ctx, `INSERT INTO equipments (code, name, level_type) VALUES ($1, 'Basis Eq', 'makine') RETURNING id`, fmt.Sprintf("EQ-BS-%d", suffix)).Scan(&eqID)
+	_ = pool.QueryRow(ctx, `INSERT INTO equipments (code, name, level_type) VALUES ($1, 'Basis Eq', 'tesis') RETURNING id`, fmt.Sprintf("EQ-BS-%d", suffix)).Scan(&eqID)
 
 	due := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
 	_, pmOut := doTestReq(router, "POST", "/api/v1/preventive-plans", tok, map[string]any{
@@ -462,24 +567,58 @@ func TestIntegration08_PMCalcBasisPlannedVsCompleted_Task1(t *testing.T) {
 		fmt.Sprintf("WO-PM-%d", suffix), eqID, pmID, due,
 	).Scan(&woID)
 
-	// 5 gün gecikmeli tamamlansa bile calc_basis='planned' olduğu için sonraki tarih 1 Ekim + 30 gün = 31 Ekim olmalı!
 	compTime := time.Date(2026, 10, 6, 10, 0, 0, 0, time.UTC)
 	rec, compOut := doTestReq(router, "POST", fmt.Sprintf("/api/v1/work-orders/%d/complete", woID), tok, map[string]any{
 		"completed_at": compTime,
 	}, nil)
-	if rec.Code != 200 || compOut["next_pm_scheduled_at"] != "2026-10-31T10:00:00Z" {
+	gotStr, _ := compOut["next_pm_scheduled_at"].(string)
+	got, parseErr := time.Parse(time.RFC3339, gotStr)
+	want := time.Date(2026, 10, 31, 10, 0, 0, 0, time.UTC)
+	if rec.Code != 200 || parseErr != nil || !got.UTC().Equal(want) {
 		t.Fatalf("expected next_pm_scheduled_at=2026-10-31T10:00:00Z, got %v", compOut["next_pm_scheduled_at"])
 	}
 }
 
-func TestIntegration09_MTBFAndOverlappingDowntimeRecalculation_Task4(t *testing.T) {
+func TestIntegration12_PMCalcBasisCompletedMode_Task1(t *testing.T) {
 	pool, router := setupIntegrationRouter(t)
 	tok, _ := auth.GenerateToken(1, "planlama@bakimplan.local", "Plan", "planlama")
 	ctx := context.Background()
 	suffix := time.Now().UnixNano()
 
 	var eqID int
-	_ = pool.QueryRow(ctx, `INSERT INTO equipments (code, name, level_type, shift_hours_per_day) VALUES ($1, 'MTBF Eq', 'makine', 16) RETURNING id`, fmt.Sprintf("EQ-MT-%d", suffix)).Scan(&eqID)
+	_ = pool.QueryRow(ctx, `INSERT INTO equipments (code, name, level_type) VALUES ($1, 'Basis Comp Eq', 'tesis') RETURNING id`, fmt.Sprintf("EQ-BSC-%d", suffix)).Scan(&eqID)
+
+	due := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	_, pmOut := doTestReq(router, "POST", "/api/v1/preventive-plans", tok, map[string]any{
+		"equipment_id": eqID, "name": "30 Gün Completed", "plan_type": "time", "interval_days": 30, "calc_basis": "completed", "next_due_at": due,
+	}, nil)
+	pmID := int(pmOut["id"].(float64))
+
+	var woID int64
+	_ = pool.QueryRow(ctx,
+		`INSERT INTO work_orders (code, equipment_id, wo_type, preventive_plan_id, status, title, scheduled_at)
+		 VALUES ($1, $2, 'preventive', $3, 'acik', 'PM Test Completed', $4) RETURNING id`,
+		fmt.Sprintf("WO-PMC-%d", suffix), eqID, pmID, due,
+	).Scan(&woID)
+
+	compTime := time.Date(2026, 10, 6, 10, 0, 0, 0, time.UTC)
+	rec, compOut := doTestReq(router, "POST", fmt.Sprintf("/api/v1/work-orders/%d/complete", woID), tok, map[string]any{
+		"completed_at": compTime,
+	}, nil)
+	// calc_basis='completed' olduğunda 6 Ekim + 30 gün = 5 Kasım olmalı!
+	if rec.Code != 200 || compOut["next_pm_scheduled_at"] != "2026-11-05T10:00:00Z" {
+		t.Fatalf("expected next_pm_scheduled_at=2026-11-05T10:00:00Z, got %v", compOut["next_pm_scheduled_at"])
+	}
+}
+
+func TestIntegration13_MTBFAndOverlappingDowntimeRecalculation_Task4(t *testing.T) {
+	pool, router := setupIntegrationRouter(t)
+	tok, _ := auth.GenerateToken(1, "planlama@bakimplan.local", "Plan", "planlama")
+	ctx := context.Background()
+	suffix := time.Now().UnixNano()
+
+	var eqID int
+	_ = pool.QueryRow(ctx, `INSERT INTO equipments (code, name, level_type, shift_hours_per_day) VALUES ($1, 'MTBF Eq', 'tesis', 16) RETURNING id`, fmt.Sprintf("EQ-MT-%d", suffix)).Scan(&eqID)
 
 	_, _ = doTestReq(router, "POST", "/api/v1/downtime-events", tok, map[string]any{
 		"equipment_id": eqID, "start_time": "2026-10-12T09:00:00Z", "end_time": "2026-10-12T12:00:00Z", "reason": "A1",
@@ -489,11 +628,10 @@ func TestIntegration09_MTBFAndOverlappingDowntimeRecalculation_Task4(t *testing.
 	}, nil)
 
 	_, m1 := doTestReq(router, "GET", fmt.Sprintf("/api/v1/metrics/reliability?equipment_id=%d&days=10", eqID), tok, nil, nil)
-	if m1["downtime_hours"].(float64) != 4.0 { // 09:00 - 13:00 = 4 saat
+	if m1["downtime_hours"].(float64) != 4.0 {
 		t.Fatalf("expected 4.0 merged hours, got %v", m1["downtime_hours"])
 	}
 
-	// Geçmiş olayı güncelle (11:00 - 15:00) -> Toplam 09:00-15:00 = 6.0 saat olmalı
 	dt2ID := int64(dt2["id"].(float64))
 	_, _ = doTestReq(router, "PATCH", fmt.Sprintf("/api/v1/downtime-events/%d", dt2ID), tok, map[string]any{
 		"start_time": "2026-10-12T11:00:00Z", "end_time": "2026-10-12T15:00:00Z",
@@ -505,7 +643,7 @@ func TestIntegration09_MTBFAndOverlappingDowntimeRecalculation_Task4(t *testing.
 	}
 }
 
-func TestIntegration10_WorkOrderKeysetPagination(t *testing.T) {
+func TestIntegration14_WorkOrderKeysetPagination(t *testing.T) {
 	_, router := setupIntegrationRouter(t)
 	tok, _ := auth.GenerateToken(1, "teknisyen@bakimplan.local", "Tek", "teknisyen")
 	rec, out := doTestReq(router, "GET", "/api/v1/work-orders?limit=5", tok, nil, nil)
@@ -514,7 +652,7 @@ func TestIntegration10_WorkOrderKeysetPagination(t *testing.T) {
 	}
 }
 
-func TestIntegration11_TechnicianWorkloadEndpoint(t *testing.T) {
+func TestIntegration15_TechnicianWorkloadEndpoint(t *testing.T) {
 	_, router := setupIntegrationRouter(t)
 	tok, _ := auth.GenerateToken(1, "planlama@bakimplan.local", "Plan", "planlama")
 	rec, out := doTestReq(router, "GET", "/api/v1/technicians/workload", tok, nil, nil)
@@ -523,7 +661,7 @@ func TestIntegration11_TechnicianWorkloadEndpoint(t *testing.T) {
 	}
 }
 
-func TestIntegration12_AuditLogAppendOnlyVerification(t *testing.T) {
+func TestIntegration16_AuditLogAppendOnlyVerification(t *testing.T) {
 	_, router := setupIntegrationRouter(t)
 	adminTok, _ := auth.GenerateToken(1, "yonetici@bakimplan.local", "Admin", "yonetici")
 	rec, out := doTestReq(router, "GET", "/api/v1/audit-logs", adminTok, nil, nil)

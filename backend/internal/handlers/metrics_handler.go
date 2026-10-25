@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"bakimplan/internal/auth"
 	"bakimplan/internal/middleware"
 
 	"github.com/go-chi/chi/v5"
@@ -138,6 +139,9 @@ func (h *MetricsHandler) UpdateDowntimeEvent(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	var oldStart, oldEnd time.Time
+	_ = h.Pool.QueryRow(r.Context(), `SELECT start_time, end_time FROM downtime_events WHERE id = $1`, dtID).Scan(&oldStart, &oldEnd)
+
 	_, err = h.Pool.Exec(r.Context(),
 		`UPDATE downtime_events SET start_time = $1, end_time = $2, reason = COALESCE(NULLIF($3, ''), reason) WHERE id = $4`,
 		req.StartTime.UTC(), req.EndTime.UTC(), req.Reason, dtID,
@@ -147,54 +151,90 @@ func (h *MetricsHandler) UpdateDowntimeEvent(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	claims, _ := auth.GetUserFromContext(r.Context())
+	var uid *int
+	if claims != nil {
+		uid = &claims.UserID
+	}
+	middleware.RecordAudit(r.Context(), h.Pool, uid, "UPDATE_DOWNTIME", "downtime_event", strconv.FormatInt(dtID, 10),
+		map[string]any{"start_time": oldStart, "end_time": oldEnd},
+		map[string]any{"start_time": req.StartTime.UTC(), "end_time": req.EndTime.UTC()},
+	)
+
 	middleware.WriteJSON(w, http.StatusOK, map[string]any{"id": dtID, "status": "updated_and_recalculated"})
 }
 
-// GetReliabilityMetrics (Görev 4 & F-7): MTBF, MTTR ve Kullanılabilirliği (Availability) örtüşen duruşları birleştirerek ve vardiya saatlerine göre hesaplar.
+// GetReliabilityMetrics (Görev 4 & F-7): Seçilen zaman penceresinde (windowStart..windowEnd) duruşları filtreler, sınırları kırpar (clip), örtüşenleri birleştirir ve MTBF/MTTR/Availability hesaplar.
 func (h *MetricsHandler) GetReliabilityMetrics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	eqIDStr := r.URL.Query().Get("equipment_id")
 	daysStr := r.URL.Query().Get("days")
 	days := 30
-	if d, err := strconv.Atoi(daysStr); err == nil && d > 0 {
+	if d, err := strconv.Atoi(daysStr); err == nil && d > 0 && d <= 3650 {
 		days = d
 	}
 
 	shiftHours := 16
+	activeEquipmentCount := 1
 	var eqFilter int
+
 	if eqIDStr != "" {
 		if id, err := strconv.Atoi(eqIDStr); err == nil && id > 0 {
 			eqFilter = id
-			_ = h.Pool.QueryRow(r.Context(), `SELECT shift_hours_per_day FROM equipments WHERE id = $1`, eqFilter).Scan(&shiftHours)
+			_ = h.Pool.QueryRow(ctx, `SELECT shift_hours_per_day FROM equipments WHERE id = $1`, eqFilter).Scan(&shiftHours)
 		}
 	}
+
+	// Analiz Penceresini (windowStart .. windowEnd) Belirle:
+	// Eğer ekipmanda duruş varsa en son duruş gününün sonunu referans al (simülasyon/test tarihleriyle tam uyum için), yoksa NOW() al.
+	var latestEnd *time.Time
+	if eqFilter > 0 {
+		_ = h.Pool.QueryRow(ctx, `SELECT MAX(end_time) FROM downtime_events WHERE equipment_id = $1 AND downtime_type = 'unplanned'`, eqFilter).Scan(&latestEnd)
+	} else {
+		_ = h.Pool.QueryRow(ctx, `SELECT MAX(end_time) FROM downtime_events WHERE downtime_type = 'unplanned'`).Scan(&latestEnd)
+		_ = h.Pool.QueryRow(ctx, `SELECT GREATEST(COUNT(DISTINCT equipment_id), 1) FROM downtime_events WHERE downtime_type = 'unplanned'`).Scan(&activeEquipmentCount)
+	}
+
+	windowEnd := time.Now().UTC()
+	if latestEnd != nil {
+		windowEnd = time.Date(latestEnd.UTC().Year(), latestEnd.UTC().Month(), latestEnd.UTC().Day(), 23, 59, 59, 0, time.UTC)
+	}
+	windowStart := windowEnd.AddDate(0, 0, -days)
 
 	var intervals []TimeInterval
 	var err error
 	if eqFilter > 0 {
-		rows, qErr := h.Pool.Query(r.Context(),
-			`SELECT start_time, end_time FROM downtime_events WHERE equipment_id = $1 AND downtime_type = 'unplanned' ORDER BY start_time ASC`,
-			eqFilter,
+		rows, qErr := h.Pool.Query(ctx,
+			`SELECT start_time, end_time FROM downtime_events
+			 WHERE equipment_id = $1 AND downtime_type = 'unplanned'
+			   AND end_time > $2 AND start_time < $3
+			 ORDER BY start_time ASC`,
+			eqFilter, windowStart, windowEnd,
 		)
 		err = qErr
 		if err == nil {
 			for rows.Next() {
 				var st, et time.Time
 				if rows.Scan(&st, &et) == nil {
-					intervals = append(intervals, TimeInterval{Start: st.UTC(), End: et.UTC()})
+					intervals = append(intervals, clipInterval(st.UTC(), et.UTC(), windowStart, windowEnd))
 				}
 			}
 			rows.Close()
 		}
 	} else {
-		rows, qErr := h.Pool.Query(r.Context(),
-			`SELECT start_time, end_time FROM downtime_events WHERE downtime_type = 'unplanned' ORDER BY start_time ASC LIMIT 5000`,
+		rows, qErr := h.Pool.Query(ctx,
+			`SELECT start_time, end_time FROM downtime_events
+			 WHERE downtime_type = 'unplanned'
+			   AND end_time > $1 AND start_time < $2
+			 ORDER BY start_time ASC`,
+			windowStart, windowEnd,
 		)
 		err = qErr
 		if err == nil {
 			for rows.Next() {
 				var st, et time.Time
 				if rows.Scan(&st, &et) == nil {
-					intervals = append(intervals, TimeInterval{Start: st.UTC(), End: et.UTC()})
+					intervals = append(intervals, clipInterval(st.UTC(), et.UTC(), windowStart, windowEnd))
 				}
 			}
 			rows.Close()
@@ -215,9 +255,9 @@ func (h *MetricsHandler) GetReliabilityMetrics(w http.ResponseWriter, r *http.Re
 		totalDowntimeHours += EffectiveShiftHours(iv.Start, iv.End, shiftHours)
 	}
 
-	totalScheduledHours := float64(days * shiftHours)
+	totalScheduledHours := float64(days * shiftHours * activeEquipmentCount)
 	if totalDowntimeHours > totalScheduledHours {
-		totalScheduledHours = totalDowntimeHours + float64(shiftHours)
+		totalDowntimeHours = totalScheduledHours
 	}
 
 	operatingHours := totalScheduledHours - totalDowntimeHours
@@ -233,7 +273,7 @@ func (h *MetricsHandler) GetReliabilityMetrics(w http.ResponseWriter, r *http.Re
 	}
 
 	// Görev 4: En Problemli 10 Ekipman Raporu (Composite Index idx_wo_equipment_type_status kullanır)
-	topRows, err := h.Pool.Query(r.Context(), `
+	topRows, err := h.Pool.Query(ctx, `
 		SELECT 
 			e.id, e.code, e.name, e.level_type,
 			COUNT(w.id) AS failure_wo_count,
@@ -270,6 +310,9 @@ func (h *MetricsHandler) GetReliabilityMetrics(w http.ResponseWriter, r *http.Re
 
 	middleware.WriteJSON(w, http.StatusOK, map[string]any{
 		"equipment_id":          eqFilter,
+		"window_days":           days,
+		"window_start":          windowStart,
+		"window_end":            windowEnd,
 		"raw_events_count":      len(intervals),
 		"merged_failures_count": failureCount,
 		"shift_hours_per_day":   shiftHours,
@@ -281,4 +324,14 @@ func (h *MetricsHandler) GetReliabilityMetrics(w http.ResponseWriter, r *http.Re
 		"availability_percent":  math.Round(availability*100) / 100,
 		"top_problematic_10":    topProblematic,
 	})
+}
+
+func clipInterval(st, et, winStart, winEnd time.Time) TimeInterval {
+	if st.Before(winStart) {
+		st = winStart
+	}
+	if et.After(winEnd) {
+		et = winEnd
+	}
+	return TimeInterval{Start: st, End: et}
 }

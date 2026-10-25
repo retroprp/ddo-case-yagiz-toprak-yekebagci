@@ -171,10 +171,42 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     key VARCHAR(255) PRIMARY KEY,
-    user_id INT,
+    user_id INT NOT NULL DEFAULT 0,          -- anahtarı ilk kullanan kullanıcı
     method VARCHAR(20) NOT NULL,
     path VARCHAR(255) NOT NULL,
-    status_code INT NOT NULL,
-    response_body JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    request_hash TEXT NOT NULL DEFAULT '',   -- aynı anahtar + farklı gövde -> 409
+    state VARCHAR(20) NOT NULL DEFAULT 'in_progress' CHECK (state IN ('in_progress', 'completed')),
+    status_code INT,                         -- in_progress iken NULL
+    response_body JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '24 hours'
 );
+
+-- Mevcut (eski) şemadan gelen kurulumlar için: eksik kolonları tamamla.
+ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS user_id INT;
+UPDATE idempotency_keys SET user_id = 0 WHERE user_id IS NULL;
+ALTER TABLE idempotency_keys ALTER COLUMN user_id SET DEFAULT 0;
+ALTER TABLE idempotency_keys ALTER COLUMN user_id SET NOT NULL;
+
+ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS request_hash TEXT;
+UPDATE idempotency_keys SET request_hash = '' WHERE request_hash IS NULL;
+ALTER TABLE idempotency_keys ALTER COLUMN request_hash SET NOT NULL;
+
+ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS state VARCHAR(20) NOT NULL DEFAULT 'in_progress';
+ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '24 hours';
+ALTER TABLE idempotency_keys ALTER COLUMN status_code DROP NOT NULL;
+ALTER TABLE idempotency_keys ALTER COLUMN response_body DROP NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_idempotency_expiry ON idempotency_keys (expires_at);
+
+-- Denetim kaydı değiştirilemez (append-only): UPDATE/DELETE veritabanı seviyesinde engellenir.
+CREATE OR REPLACE FUNCTION audit_logs_block_modification() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_logs is append-only';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS audit_logs_append_only ON audit_logs;
+CREATE TRIGGER audit_logs_append_only
+    BEFORE UPDATE OR DELETE ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION audit_logs_block_modification();

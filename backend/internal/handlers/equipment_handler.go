@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -9,6 +11,7 @@ import (
 	"bakimplan/internal/middleware"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -18,6 +21,47 @@ type EquipmentHandler struct {
 
 func NewEquipmentHandler(pool *pgxpool.Pool) *EquipmentHandler {
 	return &EquipmentHandler{Pool: pool}
+}
+
+var expectedParentLevel = map[string]string{
+	"tesis":   "",       // Kök düğüm, parent_id NULL olmalı
+	"hat":     "tesis",  // Hat yalnızca Tesis altına bağlanabilir
+	"makine":  "hat",    // Makine yalnızca Hat altına bağlanabilir
+	"bilesen": "makine", // Bileşen yalnızca Makine altına bağlanabilir
+}
+
+// validateHierarchyLevel: Tesis -> Hat -> Makine -> Bileşen seviye kuralını doğrular.
+func validateHierarchyLevel(ctx context.Context, q interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}, childLevel string, parentID *int) error {
+	expectedParent, ok := expectedParentLevel[childLevel]
+	if !ok {
+		return fmt.Errorf("geçersiz ekipman seviyesi: %s", childLevel)
+	}
+
+	if expectedParent == "" {
+		if parentID != nil {
+			return fmt.Errorf("'tesis' en üst seviyedir, başka bir ekipmanın altına bağlanamaz (parent_id null olmalıdır)")
+		}
+		return nil
+	}
+
+	if parentID == nil {
+		return fmt.Errorf("'%s' seviyesindeki bir ekipman kök olamaz; bir '%s' altına bağlanmalıdır", childLevel, expectedParent)
+	}
+
+	var actualParentLevel string
+	err := q.QueryRow(ctx, `SELECT level_type FROM equipments WHERE id = $1`, *parentID).Scan(&actualParentLevel)
+	if err != nil {
+		return fmt.Errorf("üst ekipman (#%d) bulunamadı", *parentID)
+	}
+
+	if actualParentLevel != expectedParent {
+		return fmt.Errorf("hiyerarşi kuralı ihlali: '%s' seviyesi yalnızca '%s' altına bağlanabilir (hedef ebeveyn '%s' seviyesinde)",
+			childLevel, expectedParent, actualParentLevel)
+	}
+
+	return nil
 }
 
 type EquipmentNode struct {
@@ -121,8 +165,8 @@ func (h *EquipmentHandler) GetTree(w http.ResponseWriter, r *http.Request) {
 	}
 
 	middleware.WriteJSON(w, http.StatusOK, map[string]any{
-		"tree":        roots,
-		" flat_count": len(allNodes),
+		"tree":       roots,
+		"flat_count": len(allNodes),
 	})
 }
 
@@ -147,6 +191,12 @@ func (h *EquipmentHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ShiftHoursPerDay <= 0 || req.ShiftHoursPerDay > 24 {
 		req.ShiftHoursPerDay = 16
+	}
+
+	// Hiyerarşi Seviye Kontrolü (Tesis -> Hat -> Makine -> Bileşen)
+	if err := validateHierarchyLevel(r.Context(), h.Pool, req.LevelType, req.ParentID); err != nil {
+		middleware.WriteError(w, http.StatusUnprocessableEntity, "INVALID_HIERARCHY_LEVEL", err.Error())
+		return
 	}
 
 	var id int
@@ -181,7 +231,7 @@ type moveEquipmentReq struct {
 	NewParentID *int `json:"new_parent_id"`
 }
 
-// Move: Ekipmanı ağaçta başka bir düğümün altına taşır; WITH RECURSIVE ile döngü (cycle) oluşmasını engeller!
+// Move: Ekipmanı ağaçta başka bir düğümün altına taşır; WITH RECURSIVE ile döngü (cycle) oluşmasını ve yanlış seviye bağlanmasını engeller!
 func (h *EquipmentHandler) Move(w http.ResponseWriter, r *http.Request) {
 	eqID, err := strconv.Atoi(chi.URLParam(r, "id"))
 	if err != nil {
@@ -209,13 +259,14 @@ func (h *EquipmentHandler) Move(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(ctx)
 
 	var oldParentID *int
-	err = tx.QueryRow(ctx, `SELECT parent_id FROM equipments WHERE id = $1 FOR UPDATE`, eqID).Scan(&oldParentID)
+	var childLevel string
+	err = tx.QueryRow(ctx, `SELECT parent_id, level_type FROM equipments WHERE id = $1 FOR UPDATE`, eqID).Scan(&oldParentID, &childLevel)
 	if err != nil {
 		middleware.WriteError(w, http.StatusNotFound, "NOT_FOUND", "Ekipman bulunamadı.")
 		return
 	}
 
-	// Yeni parent_id, bu ekipmanın kendi alt ağacında (descendants) yer alıyor mu kontrol et!
+	// 1. ÖNCE DÖNGÜ (CYCLE) KONTROLÜ: Yeni parent_id, bu ekipmanın kendi alt ağacında (descendants) yer alıyor mu?
 	if req.NewParentID != nil {
 		var createsCycle bool
 		cycleQuery := `
@@ -235,6 +286,12 @@ func (h *EquipmentHandler) Move(w http.ResponseWriter, r *http.Request) {
 			middleware.WriteError(w, http.StatusConflict, "CYCLE_DETECTED", "Hedef ebeveyn bu ekipmanın alt ağacında bulunuyor! Döngü (cycle) engellendi.")
 			return
 		}
+	}
+
+	// 2. HİYERARŞİ SEVİYE TİPİ KONTROLÜ (Tesis -> Hat -> Makine -> Bileşen)
+	if err := validateHierarchyLevel(ctx, tx, childLevel, req.NewParentID); err != nil {
+		middleware.WriteError(w, http.StatusUnprocessableEntity, "INVALID_HIERARCHY_LEVEL", err.Error())
+		return
 	}
 
 	_, err = tx.Exec(ctx, `UPDATE equipments SET parent_id = $1 WHERE id = $2`, req.NewParentID, eqID)
@@ -260,6 +317,7 @@ func (h *EquipmentHandler) Move(w http.ResponseWriter, r *http.Request) {
 
 	middleware.WriteJSON(w, http.StatusOK, map[string]any{
 		"id":            eqID,
+		"level_type":    childLevel,
 		"old_parent_id": oldParentID,
 		"new_parent_id": req.NewParentID,
 		"status":        "moved",

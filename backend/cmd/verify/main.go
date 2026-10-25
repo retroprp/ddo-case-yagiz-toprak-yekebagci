@@ -213,7 +213,7 @@ func main() {
 		}
 		top10 := b["top_problematic_10"].([]any)
 		if len(top10) != 10 {
-			return "", fmt.Errorf("Top 10 listesi %d eleman döndü", len(top10))
+			return "", fmt.Errorf("top 10 listesi %d eleman döndü", len(top10))
 		}
 		return fmt.Sprintf("MTBF=%.1fs, MTTR=%.1fs, Availability=%%%v", b["mtbf_hours"], b["mttr_hours"], b["availability_percent"]), nil
 	})
@@ -285,9 +285,10 @@ func main() {
 					"warehouse_id": 3,
 					"quantity":     1,
 				}, nil)
-				if st == 201 {
+				switch st {
+				case 201:
 					atomic.AddInt32(&successCount, 1)
-				} else if st == 409 {
+				case 409:
 					atomic.AddInt32(&conflictCount, 1)
 				}
 			}()

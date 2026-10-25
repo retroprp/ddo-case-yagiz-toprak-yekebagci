@@ -22,7 +22,6 @@ func NewMaintenanceHandler(pool *pgxpool.Pool) *MaintenanceHandler {
 	return &MaintenanceHandler{Pool: pool}
 }
 
-// F-2: Arıza Bildirimi Oluşturma
 type createFailureReq struct {
 	EquipmentID int    `json:"equipment_id"`
 	Title       string `json:"title"`
@@ -106,7 +105,6 @@ func (h *MaintenanceHandler) ListFailureReports(w http.ResponseWriter, r *http.R
 	middleware.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
-// F-3: İş Emirleri Listeleme (Keyset / Cursor Pagination Destekli!)
 func (h *MaintenanceHandler) ListWorkOrders(w http.ResponseWriter, r *http.Request) {
 	cursorStr := r.URL.Query().Get("cursor")
 	limitStr := r.URL.Query().Get("limit")
@@ -115,7 +113,7 @@ func (h *MaintenanceHandler) ListWorkOrders(w http.ResponseWriter, r *http.Reque
 		limit = l
 	}
 
-	var cursor int64 = 9223372036854775807 // Max Int64
+	var cursor int64 = 9223372036854775807
 	if c, err := strconv.ParseInt(cursorStr, 10, 64); err == nil && c > 0 {
 		cursor = c
 	}
@@ -190,8 +188,8 @@ func (h *MaintenanceHandler) CreateWorkOrder(w http.ResponseWriter, r *http.Requ
 		middleware.WriteError(w, http.StatusBadRequest, "INVALID_JSON", "Geçersiz JSON.")
 		return
 	}
-	if req.EquipmentID <= 0 || req.Title == "" {
-		middleware.WriteError(w, http.StatusBadRequest, "VALIDATION_ERROR", "equipment_id ve title zorunludur.")
+	if req.EquipmentID <= 0 || req.Title == "" || req.LaborCostKurus < 0 {
+		middleware.WriteError(w, http.StatusBadRequest, "VALIDATION_ERROR", "Geçerli equipment_id, title ve negatif olmayan labor_cost_kurus zorunludur.")
 		return
 	}
 	if req.WoType == "" {
@@ -228,12 +226,12 @@ func (h *MaintenanceHandler) CreateWorkOrder(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// Görev 1 & F-3: İş Emri Tamamlama (Önleyici bakım ise calc_basis 'planned' veya 'completed' kuralına göre sonraki tarihi hesaplar!)
 type completeWorkOrderReq struct {
 	CompletedAt    *time.Time `json:"completed_at"`
 	LaborCostKurus *int64     `json:"labor_cost_kurus"`
 }
 
+// CompleteWorkOrder: İş emrini tamamlar, rezerve parçaları fiziksel stoktan düşer ('consume') ve önleyici bakımsa sonraki tarihi hesaplar.
 func (h *MaintenanceHandler) CompleteWorkOrder(w http.ResponseWriter, r *http.Request) {
 	woID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil {
@@ -260,16 +258,21 @@ func (h *MaintenanceHandler) CompleteWorkOrder(w http.ResponseWriter, r *http.Re
 	var pmPlanID *int
 	var scheduledAt *time.Time
 	var currentLabor int64
+	var currentStatus string
 	err = tx.QueryRow(ctx,
-		`SELECT preventive_plan_id, scheduled_at, labor_cost_kurus FROM work_orders WHERE id = $1 FOR UPDATE`,
+		`SELECT preventive_plan_id, scheduled_at, labor_cost_kurus, status FROM work_orders WHERE id = $1 FOR UPDATE`,
 		woID,
-	).Scan(&pmPlanID, &scheduledAt, &currentLabor)
+	).Scan(&pmPlanID, &scheduledAt, &currentLabor, &currentStatus)
 	if err != nil {
 		middleware.WriteError(w, http.StatusNotFound, "WO_NOT_FOUND", "İş emri bulunamadı.")
 		return
 	}
+	if currentStatus == "tamamlandi" {
+		middleware.WriteError(w, http.StatusConflict, "WO_ALREADY_COMPLETED", "Bu iş emri zaten tamamlanmış.")
+		return
+	}
 
-	if req.LaborCostKurus != nil {
+	if req.LaborCostKurus != nil && *req.LaborCostKurus >= 0 {
 		currentLabor = *req.LaborCostKurus
 	}
 
@@ -280,6 +283,35 @@ func (h *MaintenanceHandler) CompleteWorkOrder(w http.ResponseWriter, r *http.Re
 	if err != nil {
 		middleware.WriteError(w, http.StatusInternalServerError, "UPDATE_ERROR", err.Error())
 		return
+	}
+
+	// Bu iş emrine rezerve edilmiş parçaları 'consumed' yap ve stock_movements tablosuna (-quantity) çıkış hareketi yaz!
+	resRows, err := tx.Query(ctx,
+		`UPDATE part_reservations SET status = 'consumed'
+		 WHERE work_order_id = $1 AND status = 'reserved'
+		 RETURNING part_id, warehouse_id, quantity`,
+		woID,
+	)
+	if err == nil {
+		type consumedItem struct {
+			PartID, WarehouseID, Qty int
+		}
+		var items []consumedItem
+		for resRows.Next() {
+			var ci consumedItem
+			if resRows.Scan(&ci.PartID, &ci.WarehouseID, &ci.Qty) == nil {
+				items = append(items, ci)
+			}
+		}
+		resRows.Close()
+
+		for _, ci := range items {
+			_, _ = tx.Exec(ctx,
+				`INSERT INTO stock_movements (part_id, warehouse_id, quantity_change, movement_type, reference_work_order_id)
+				 VALUES ($1, $2, $3, 'consume', $4)`,
+				ci.PartID, ci.WarehouseID, -ci.Qty, woID,
+			)
+		}
 	}
 
 	var nextDueAt *time.Time
@@ -301,7 +333,7 @@ func (h *MaintenanceHandler) CompleteWorkOrder(w http.ResponseWriter, r *http.Re
 					baseTime = *planNextDue
 				}
 			}
-			computed := baseTime.AddDate(0, 0, *intervalDays)
+			computed := baseTime.UTC().AddDate(0, 0, *intervalDays)
 			nextDueAt = &computed
 
 			_, _ = tx.Exec(ctx,
@@ -324,14 +356,13 @@ func (h *MaintenanceHandler) CompleteWorkOrder(w http.ResponseWriter, r *http.Re
 	})
 }
 
-// Görev 1 (T-1 & F-4): Önleyici Bakım Planı Oluşturma ve Sayaç Okuması (İdempotent Otomatik İş Emri Üretimi)
 type createPMPlanReq struct {
 	EquipmentID   int        `json:"equipment_id"`
 	Name          string     `json:"name"`
-	PlanType      string     `json:"plan_type"` // "time", "meter", "both"
+	PlanType      string     `json:"plan_type"`
 	IntervalDays  *int       `json:"interval_days"`
 	IntervalHours *int       `json:"interval_hours"`
-	CalcBasis     string     `json:"calc_basis"` // "planned" | "completed"
+	CalcBasis     string     `json:"calc_basis"`
 	NextDueAt     *time.Time `json:"next_due_at"`
 	NextDueMeter  *int       `json:"next_due_meter"`
 }
@@ -425,7 +456,6 @@ type meterReadingReq struct {
 	ReadingHours int `json:"reading_hours"`
 }
 
-// RecordMeterReading (Görev 1): Sayaç okuması geldiğinde eşik aşıldıysa idempotent olarak otomatik iş emri üretir; geciken bakımlar birikmez!
 func (h *MaintenanceHandler) RecordMeterReading(w http.ResponseWriter, r *http.Request) {
 	eqID, err := strconv.Atoi(chi.URLParam(r, "id"))
 	if err != nil {
@@ -447,6 +477,15 @@ func (h *MaintenanceHandler) RecordMeterReading(w http.ResponseWriter, r *http.R
 	}
 	defer tx.Rollback(ctx)
 
+	// Sayaç geriye gidemez (Monotonic artış kontrolü)
+	var lastReading int
+	_ = tx.QueryRow(ctx, `SELECT COALESCE(MAX(reading_hours), 0) FROM meter_readings WHERE equipment_id = $1`, eqID).Scan(&lastReading)
+	if req.ReadingHours < lastReading {
+		middleware.WriteError(w, http.StatusBadRequest, "METER_ROLLBACK",
+			fmt.Sprintf("Sayaç okuması (%d) son okumadan (%d) küçük olamaz.", req.ReadingHours, lastReading))
+		return
+	}
+
 	_, err = tx.Exec(ctx,
 		`INSERT INTO meter_readings (equipment_id, reading_hours) VALUES ($1, $2)`,
 		eqID, req.ReadingHours,
@@ -456,7 +495,6 @@ func (h *MaintenanceHandler) RecordMeterReading(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Bu ekipmana ait sayaç bazlı aktif planları kontrol et
 	rows, err := tx.Query(ctx,
 		`SELECT id, name, interval_hours, next_due_meter
 		 FROM preventive_plans
@@ -492,7 +530,6 @@ func (h *MaintenanceHandler) RecordMeterReading(w http.ResponseWriter, r *http.R
 	for _, p := range plans {
 		code := fmt.Sprintf("PM-M-%d-%d", p.ID, p.NextDueMeter)
 		var woID int64
-		// uq_active_pm_work_order partial unique index sayesinde halihazırda açık bir iş emri varsa İKİNCİSİ AÇILMAZ (birikmeme & idempotans kuralı)!
 		err := tx.QueryRow(ctx,
 			`INSERT INTO work_orders (code, equipment_id, wo_type, preventive_plan_id, status, priority, title, scheduled_at)
 			 VALUES ($1, $2, 'preventive', $3, 'acik', 'yuksek', $4, NOW())
@@ -527,7 +564,6 @@ func (h *MaintenanceHandler) RecordMeterReading(w http.ResponseWriter, r *http.R
 	})
 }
 
-// TriggerDueTimePMs: Süresi gelmiş (next_due_at <= simülasyon zamanı) planları tarar; gecikenleri biriktirmeden en fazla 1 açık iş emri üretir!
 func (h *MaintenanceHandler) TriggerDueTimePMs(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	if ref := r.URL.Query().Get("as_of"); ref != "" {
@@ -567,7 +603,6 @@ func (h *MaintenanceHandler) TriggerDueTimePMs(w http.ResponseWriter, r *http.Re
 	for _, p := range plans {
 		code := fmt.Sprintf("PM-T-%d-%d", p.ID, p.NextDueAt.Unix())
 		var woID int64
-		// uq_active_pm_work_order kısıtı sayesinde açık bir iş emri varsa yeni iş emri birikmez!
 		err := h.Pool.QueryRow(ctx,
 			`INSERT INTO work_orders (code, equipment_id, wo_type, preventive_plan_id, status, priority, title, scheduled_at)
 			 VALUES ($1, $2, 'preventive', $3, 'acik', 'normal', $4, $5)
@@ -589,7 +624,6 @@ func (h *MaintenanceHandler) TriggerDueTimePMs(w http.ResponseWriter, r *http.Re
 	})
 }
 
-// F-6: Teknisyen İş Yükü Listesi
 func (h *MaintenanceHandler) GetTechnicianWorkload(w http.ResponseWriter, r *http.Request) {
 	query := `
 	SELECT 

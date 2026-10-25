@@ -20,6 +20,37 @@ func NewInventoryHandler(pool *pgxpool.Pool) *InventoryHandler {
 	return &InventoryHandler{Pool: pool}
 }
 
+// ListWarehouses: stok hareketi ve parça rezervasyonu formlarında seçim yapılabilmesi için depo listesi.
+// Salt okunur; tüm kimliği doğrulanmış roller erişebilir.
+func (h *InventoryHandler) ListWarehouses(w http.ResponseWriter, r *http.Request) {
+	rows, err := h.Pool.Query(r.Context(),
+		`SELECT id, code, name FROM warehouses ORDER BY id ASC`)
+	if err != nil {
+		middleware.WriteError(w, http.StatusInternalServerError, "DB_ERROR", err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var items []map[string]any
+	for rows.Next() {
+		var id int
+		var code, name string
+		if err := rows.Scan(&id, &code, &name); err != nil {
+			continue
+		}
+		items = append(items, map[string]any{
+			"id":   id,
+			"code": code,
+			"name": name,
+		})
+	}
+	if items == nil {
+		items = []map[string]any{}
+	}
+
+	middleware.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
 // ListParts: Stok = hareketlerin toplamı kuralına göre tüm parçaların fiziksel, rezerve ve kullanılabilir stoklarını ve uyarıları döner.
 func (h *InventoryHandler) ListParts(w http.ResponseWriter, r *http.Request) {
 	query := `

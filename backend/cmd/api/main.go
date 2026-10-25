@@ -81,13 +81,22 @@ func main() {
 	maintHandler := handlers.NewMaintenanceHandler(pool)
 	metricsHandler := handlers.NewMetricsHandler(pool)
 
-	r.Route("/api/v1", func(api chi.Router) {
-		api.Use(appmw.Idempotency(pool))
+	extractUserID := func(r *http.Request) *int {
+		if claims, ok := auth.GetUserFromContext(r.Context()); ok && claims != nil {
+			uid := claims.UserID
+			return &uid
+		}
+		return nil
+	}
 
+	r.Route("/api/v1", func(api chi.Router) {
 		api.Post("/auth/login", authHandler.Login)
 
 		api.Group(func(protected chi.Router) {
+			// Önce JWT doğrulanır, ardından kullanıcıya izole Idempotency ve Otomatik Audit Log çalışır!
 			protected.Use(auth.Authenticate)
+			protected.Use(appmw.Idempotency(pool, extractUserID))
+			protected.Use(appmw.AuditTrail(pool, extractUserID))
 
 			protected.Get("/auth/me", authHandler.Me)
 
@@ -113,6 +122,7 @@ func main() {
 
 			// F-5 & T-3: Yedek Parça Stoğu ve Rezervasyon
 			protected.Get("/parts", invHandler.ListParts)
+			protected.Get("/warehouses", invHandler.ListWarehouses)
 			protected.With(auth.RequireRoles("depo", "yonetici")).Post("/stock-movements", invHandler.CreateStockMovement)
 			protected.With(auth.RequireRoles("depo", "teknisyen", "planlama", "yonetici")).Post("/work-orders/{id}/reserve-part", invHandler.ReservePartForWorkOrder)
 
