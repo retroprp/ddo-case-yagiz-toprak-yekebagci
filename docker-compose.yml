@@ -50,6 +50,9 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        # Tarayıcının erişeceği API adresi. Varsayılan, tek komutla çalışan kurulumla aynıdır.
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8080/api/v1}
     ports:
       - "3000:8080"
     depends_on:
