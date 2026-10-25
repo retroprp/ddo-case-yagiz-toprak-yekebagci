@@ -80,6 +80,7 @@ func main() {
 	invHandler := handlers.NewInventoryHandler(pool)
 	maintHandler := handlers.NewMaintenanceHandler(pool)
 	metricsHandler := handlers.NewMetricsHandler(pool)
+	lifecycleHandler := handlers.NewWorkOrderLifecycleHandler(pool)
 
 	extractUserID := func(r *http.Request) *int {
 		if claims, ok := auth.GetUserFromContext(r.Context()); ok && claims != nil {
@@ -115,6 +116,10 @@ func main() {
 			protected.With(auth.RequireRoles("planlama", "yonetici")).Post("/work-orders", maintHandler.CreateWorkOrder)
 			protected.With(auth.RequireRoles("teknisyen", "planlama", "yonetici")).Post("/work-orders/{id}/complete", maintHandler.CompleteWorkOrder)
 
+			// F-3: Yaşam döngüsü (acik -> atandi -> devam_ediyor / iptal) ve geçmiş
+			protected.With(auth.RequireRoles("teknisyen", "planlama", "yonetici")).Patch("/work-orders/{id}/status", lifecycleHandler.UpdateStatus)
+			protected.Get("/work-orders/{id}/events", lifecycleHandler.ListEvents)
+
 			// F-4 & T-1: Önleyici Bakım Planları
 			protected.Get("/preventive-plans", maintHandler.ListPMPlans)
 			protected.With(auth.RequireRoles("planlama", "yonetici")).Post("/preventive-plans", maintHandler.CreatePMPlan)
@@ -126,8 +131,10 @@ func main() {
 			protected.With(auth.RequireRoles("depo", "yonetici")).Post("/stock-movements", invHandler.CreateStockMovement)
 			protected.With(auth.RequireRoles("depo", "teknisyen", "planlama", "yonetici")).Post("/work-orders/{id}/reserve-part", invHandler.ReservePartForWorkOrder)
 
-			// F-6: Teknisyen İş Yükü
+			// F-6: Teknisyen İş Yükü ve Atama
 			protected.With(auth.RequireRoles("teknisyen", "planlama", "yonetici")).Get("/technicians/workload", maintHandler.GetTechnicianWorkload)
+			protected.With(auth.RequireRoles("planlama", "yonetici")).Post("/work-orders/{id}/assign", lifecycleHandler.AssignTechnician)
+			protected.With(auth.RequireRoles("planlama", "yonetici")).Delete("/work-orders/{id}/assign", lifecycleHandler.Unassign)
 
 			// F-7 & T-4: Güvenilirlik Göstergeleri (MTBF, MTTR, Availability)
 			protected.Get("/metrics/reliability", metricsHandler.GetReliabilityMetrics)

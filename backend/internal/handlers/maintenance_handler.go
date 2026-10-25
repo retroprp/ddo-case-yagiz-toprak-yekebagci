@@ -271,6 +271,10 @@ func (h *MaintenanceHandler) CompleteWorkOrder(w http.ResponseWriter, r *http.Re
 		middleware.WriteError(w, http.StatusConflict, "WO_ALREADY_COMPLETED", "Bu iş emri zaten tamamlanmış.")
 		return
 	}
+	if currentStatus == "iptal" {
+		middleware.WriteError(w, http.StatusConflict, "WO_CANCELLED", "İptal edilmiş iş emri tamamlanamaz.")
+		return
+	}
 
 	if req.LaborCostKurus != nil && *req.LaborCostKurus >= 0 {
 		currentLabor = *req.LaborCostKurus
@@ -282,6 +286,12 @@ func (h *MaintenanceHandler) CompleteWorkOrder(w http.ResponseWriter, r *http.Re
 	)
 	if err != nil {
 		middleware.WriteError(w, http.StatusInternalServerError, "UPDATE_ERROR", err.Error())
+		return
+	}
+
+	// Yaşam döngüsü geçmişine tamamlanma kaydı (F-3). Aynı transaction içinde.
+	if err := logWorkOrderEvent(ctx, tx, woID, currentStatus, "tamamlandi", requestActorID(r), "tamamlama"); err != nil {
+		middleware.WriteError(w, http.StatusInternalServerError, "EVENT_ERROR", err.Error())
 		return
 	}
 

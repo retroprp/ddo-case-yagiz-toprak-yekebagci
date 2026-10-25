@@ -546,3 +546,70 @@ client.test("gövde çakışması 409", function() {
   client.assert(response.status === 409, "beklenen 409, gelen " + response.status);
 });
 %}
+################################################################################
+# 12. F-3 / F-6 — İŞ EMRİ YAŞAM DÖNGÜSÜ VE TEKNİSYEN ATAMA
+################################################################################
+
+### 12.1 Yaşam döngüsü için iş emri aç
+# @name lifecycleWO
+POST {{api}}/work-orders
+Authorization: Bearer {{planlamaToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{
+  "equipment_id": {{makineId}},
+  "wo_type": "corrective",
+  "priority": "yuksek",
+  "title": "Yaşam döngüsü demosu"
+}
+
+### 12.2 Teknisyen ata (acik -> atandi)
+POST {{api}}/work-orders/{{lifecycleWO.response.body.$.id}}/assign
+Authorization: Bearer {{planlamaToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{ "technician_id": 1, "note": "vardiya teknisyeni" }
+
+### 12.3 İşi başlat (atandi -> devam_ediyor)
+PATCH {{api}}/work-orders/{{lifecycleWO.response.body.$.id}}/status
+Authorization: Bearer {{teknisyenToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{ "status": "devam_ediyor", "note": "bakıma başlandı" }
+
+### 12.4 Geçersiz geçiş (devam_ediyor -> atandi) → 409 INVALID_TRANSITION
+PATCH {{api}}/work-orders/{{lifecycleWO.response.body.$.id}}/status
+Authorization: Bearer {{teknisyenToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{ "status": "atandi" }
+
+### 12.5 PATCH ile tamamlamak yasak → 409 USE_COMPLETE_ENDPOINT
+PATCH {{api}}/work-orders/{{lifecycleWO.response.body.$.id}}/status
+Authorization: Bearer {{teknisyenToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{ "status": "tamamlandi" }
+
+### 12.6 Tamamla (stok tüketimi + PM yeniden planlama burada)
+POST {{api}}/work-orders/{{lifecycleWO.response.body.$.id}}/complete
+Authorization: Bearer {{teknisyenToken}}
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{ "labor_cost_kurus": 100000 }
+
+### 12.7 Durum geçmişi (en yeni önce, aktör adıyla)
+GET {{api}}/work-orders/{{lifecycleWO.response.body.$.id}}/events
+Authorization: Bearer {{yoneticiToken}}
+
+### 12.8 Atamayı kaldır (acik'a döner)
+# Önce 12.1 ile yeni bir iş emri açıp 12.2 ile atama yap.
+DELETE {{api}}/work-orders/1/assign
+Authorization: Bearer {{planlamaToken}}
+Idempotency-Key: {{$guid}}
