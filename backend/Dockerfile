@@ -1,14 +1,18 @@
-FROM golang:alpine AS builder
+FROM golang:1.24-alpine3.20 AS builder
 ENV GOTOOLCHAIN=auto
 WORKDIR /src
-COPY go.mod ./
-COPY . .
-RUN go mod tidy
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/api ./cmd/api
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/simulator ./cmd/simulator
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/verify ./cmd/verify
 
-FROM alpine:3.20
+# Önce bağımlılık katmanını önbelleğe al
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Kaynak kodları kopyala ve derle
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/api ./cmd/api && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/simulator ./cmd/simulator && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/verify ./cmd/verify
+
+FROM alpine:3.20.3
 RUN adduser -D -u 10001 appuser
 WORKDIR /app
 COPY --from=builder /out/api /app/api

@@ -1,0 +1,12 @@
+.git
+.github
+.env
+*.md
+*.http
+*.yaml
+loadtest/
+frontend/
+bin/
+*.exe
+*.out
+coverage.txt
