@@ -1,0 +1,154 @@
+openapi: 3.0.3
+info:
+  title: BakımPlan CMMS API
+  version: 1.0.0
+  description: Ekipman Bakım, Arıza, İş Emri, Yedek Parça Rezervasyonu ve Güvenilirlik (MTBF/MTTR) Yönetim Sistemi API Dokümantasyonu.
+servers:
+  - url: http://localhost:8080
+    description: Local Docker Compose Server
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+paths:
+  /health:
+    get:
+      summary: Sistem ve PostgreSQL sağlık durumu kontrolü
+      responses:
+        '200':
+          description: Sistem sağlıklı
+  /api/v1/auth/login:
+    post:
+      summary: Kullanıcı girişi ve JWT üretimi
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email: { type: string }
+                password: { type: string }
+      responses:
+        '200': { description: Başarılı giriş }
+        '401': { description: Hatalı kimlik bilgisi }
+  /api/v1/equipments/tree:
+    get:
+      summary: "[F-1 / T-2] WITH RECURSIVE ekipman hiyerarşisi ve maliyet/duruş roll-up ağacı"
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Hiyerarşik ağaç }
+  /api/v1/equipments/{id}/move:
+    patch:
+      summary: "[T-2] Ekipmanı ağaçta taşıma (Döngü/Cycle engellemeli)"
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        '200': { description: Taşındı }
+        '409': { description: CYCLE_DETECTED (Döngü engellendi) }
+  /api/v1/equipments/{id}/meter-readings:
+    post:
+      summary: "[T-1] Sayaç okuması girme ve idempotent otomatik iş emri üretimi"
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        '200': { description: Sayaç kaydedildi }
+  /api/v1/failure-reports:
+    get:
+      summary: "[F-2] Arıza bildirimlerini listele"
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Liste }
+    post:
+      summary: "[F-2] Yeni arıza bildirimi oluştur (Idempotency-Key destekli)"
+      security: [{ bearerAuth: [] }]
+      responses:
+        '201': { description: Oluşturuldu }
+  /api/v1/work-orders:
+    get:
+      summary: "[F-3] İş emirlerini Keyset (Cursor) sayfalama ile listele"
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Sayfalanmış liste }
+    post:
+      summary: "[F-3] Yeni iş emri oluştur"
+      security: [{ bearerAuth: [] }]
+      responses:
+        '201': { description: Oluşturuldu }
+  /api/v1/work-orders/{id}/complete:
+    post:
+      summary: "[F-3 / T-1] İş emrini tamamla ve planned/completed bazına göre sonraki PM tarihini hesapla"
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        '200': { description: Tamamlandı }
+  /api/v1/work-orders/{id}/reserve-part:
+    post:
+      summary: "[T-3] İş emrine yedek parça rezerve et (SELECT ... FOR UPDATE ve BOM kontrollü)"
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        '201': { description: Rezerve edildi }
+        '409': { description: INSUFFICIENT_STOCK }
+        '422': { description: BOM_INCOMPATIBLE }
+  /api/v1/parts:
+    get:
+      summary: "[F-5 / T-3] Yedek parça stoğu (Stok = Hareketlerin Toplamı) ve kritik sıfır stok uyarıları"
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Parça stok listesi }
+  /api/v1/warehouses:
+    get:
+      summary: "Depo listesi (stok hareketi ve parça rezervasyonu formları için salt okunur)"
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Depo listesi }
+        '401': { description: UNAUTHORIZED }
+  /api/v1/technicians/workload:
+    get:
+      summary: "[F-6] Teknisyen aktif ve tamamlanan iş yükü"
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: İş yükü listesi }
+  /api/v1/metrics/reliability:
+    get:
+      summary: "[F-7 / T-4] MTBF, MTTR, Kullanılabilirlik (Örtüşen duruş birleştirmeli) ve En Problemli 10 Ekipman"
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Güvenilirlik metrikleri }
+  /api/v1/audit-logs:
+    get:
+      summary: Append-only denetim kayıtları (Yalnızca Yönetici)"
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Denetim kayıtları }
+        '403': { description: FORBIDDEN_ROLE }
