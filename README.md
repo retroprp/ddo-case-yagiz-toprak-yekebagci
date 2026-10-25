@@ -14,15 +14,46 @@ Vue 3 `<script setup>` · Vite · TailwindCSS · Docker Compose
 
 ## 1. Hızlı Başlangıç
 
-Sistem hiçbir manuel veritabanı veya migrasyon adımına ihtiyaç duymaz. Tek komut şemayı
-kurar, migrasyonları uygular ve deterministik simülatör ile **2.000 ekipman + 3 yıllık
-bakım/arıza geçmişini** yükler.
+Sistem hiçbir manuel veritabanı, migrasyon veya seed adımına ihtiyaç duymaz. Depo
+klonlandıktan sonra **tek komut** ile ayağa kalkar.
+
+### 1.1. Depoyu edinme (ön koşul)
+
+Kodu indirip proje dizinine geçin:
 
 ```bash
 git clone https://github.com/retroprp/ddo-case-yagiz-toprak-yekebagci.git
 cd ddo-case-yagiz-toprak-yekebagci
+```
+
+### 1.2. Tek komutla başlatma
+
+```bash
 cp .env.example .env
 docker compose up --build -d
+```
+
+Bu komut şunların **hepsini** kendisi yapar:
+
+| Adım | Nasıl |
+|---|---|
+| Şemayı kurar | Gömülü migrasyonlar (`001`, `002`) ilk açılışta uygulanır |
+| 2.000 ekipmanı yükler | Simülatör servisi `SEED_VALUE=42` ile deterministik veri üretir |
+| Servisleri sıraya koyar | `depends_on: service_healthy` — DB hazır olmadan API başlamaz |
+| Ağ ve portları açar | `3000` (panel), `8080` (API), `5432` (DB, yalnızca localhost) |
+
+Manuel adım yok: `npm install`, `psql < schema.sql`, `migrate`, `seed` gibi komutların
+hiçbirini yazmanız gerekmez.
+
+#### İsteğe bağlı: ayarları özelleştirme
+
+Varsayılanlarla çalışmak istiyorsanız ek adım gerekmez — `docker-compose.yml` içindeki
+`${VAR:-varsayılan}` değerleri kullanılır. Ayar değiştirecekseniz (JWT anahtarı, seed
+değeri, telefondan erişim için API adresi vb.) `.env` oluşturun:
+
+```bash
+cp .env.example .env    # sonra düzenleyin; .env git'e girmez
+docker compose up -d --build
 ```
 
 İlk açılışta servislerin sağlıklı olmasını bekle:
@@ -412,8 +443,12 @@ Seviye kuralı: `tesis → hat → makine → bilesen`. Makine doğrudan tesis a
 | `DATABASE_URL` | `postgres://…@db:5432/bakimplan_db` | API ve simülatör bağlantısı |
 | `JWT_SECRET` | demo değeri | **Üretimde değiştirin** |
 | `SEED_VALUE` | `42` | Simülatör determinizm tohumu |
-| `VITE_API_URL` | `http://localhost:8080/api/v1` | Tarayıcının göreceği API adresi |
+| `VITE_API_URL` | `http://localhost:8080/api/v1` | Tarayıcının göreceği API adresi (build arg) |
 | `K6_API_URL` | `http://backend:8080` | Yük testi hedefi |
+
+`.env` dosyası git'e girmez (`.gitignore`'da). Dosya bulunmazsa `docker-compose.yml`
+içindeki `${VAR:-varsayılan}` değerleri kullanılır; yani sistem `.env` olmadan da
+çalışır — ancak ayarların tek yerde görünür olması için oluşturulması önerilir.
 
 ---
 
