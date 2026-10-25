@@ -16,21 +16,48 @@ export const navRoutes = [
   { path: '/audit', name: 'audit', code: 'AUDIT', title: 'Denetim Kaydı', roles: ['yonetici'], component: InventoryAndAuditView, props: { section: 'audit' } }
 ]
 
+// Oturum yokken gösterilen boş ekran. Giriş formunu App.vue render eder;
+// burada amaç yalnızca "/login" için geçerli bir rota tanımı olması.
+const LoginView = { name: 'LoginPlaceholder', setup: () => () => null }
+
+// Verilen rolün görebileceği ilk ekran.
+export function firstRouteFor(user) {
+  if (!user) return null
+  return navRoutes.find((r) => r.roles.includes(user.role)) || null
+}
+
 const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', redirect: '/reliability' },
+    { path: '/login', name: 'login', component: LoginView },
     ...navRoutes
   ]
 })
 
+/**
+ * Erişim kuralları:
+ *  - Oturum yok  → /login (başka bir URL'e doğrudan gelinebilse bile)
+ *  - Oturum var  → rolün yetkisi olmayan ekrana girilirse ilk izinli ekrana yönlendir
+ *
+ * Not: Bu kontrol YALNIZCA kullanıcı deneyimi içindir. Gerçek yetkilendirme
+ * backend'de `RequireRoles` middleware'i ile yapılır (403).
+ */
 router.beforeEach((to, _from, next) => {
-  if (!store.user) return next()
-  const allowedRoles = to.meta?.roles || navRoutes.find(r => r.name === to.name)?.roles
-  if (allowedRoles && !allowedRoles.includes(store.user.role)) {
-    const firstAllowed = navRoutes.find(r => r.roles.includes(store.user.role))
-    return next(firstAllowed ? firstAllowed.path : '/equipments')
+  if (!store.user) {
+    return to.name === 'login' ? next() : next({ name: 'login' })
   }
+
+  const first = firstRouteFor(store.user)
+  if (!first) return next({ name: 'login' })
+
+  if (to.name === 'login') return next(first.path)
+
+  const allowedRoles = to.meta?.roles || navRoutes.find((r) => r.name === to.name)?.roles
+  if (allowedRoles && !allowedRoles.includes(store.user.role)) {
+    return next(first.path)
+  }
+
   next()
 })
 
