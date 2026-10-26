@@ -14,7 +14,7 @@ openapi: 3.0.3
 
 info:
   title: BakımPlan CMMS API
-  version: 1.1.0
+  version: 1.2.0
   description: |
     Ekipman Bakım, Arıza, İş Emri, Yedek Parça Rezervasyonu ve Güvenilirlik
     (MTBF / MTTR / Kullanılabilirlik) yönetim sistemi.
@@ -364,6 +364,11 @@ components:
       description: |
         Örtüşen duruş aralıkları birleştirilir (çift sayım önlenir).
         Vardiya dışı süreler payda ve paydan düşülür.
+
+        `top_problematic_10` varsayılan olarak materyalize view'dan gelir
+        (hızlı ama birkaç saniye bayat olabilir). `?fresh=true` ile canlı
+        sorguya düşülür. Kaynak ve tazelik `top_source` / `top_refreshed_at`
+        alanlarında bildirilir.
       properties:
         equipment_id: { type: integer, description: 0 = tesis geneli }
         window_days: { type: integer }
@@ -378,6 +383,15 @@ components:
         mtbf_hours: { type: number, format: double }
         mttr_hours: { type: number, format: double }
         availability_percent: { type: number, format: double }
+        top_source:
+          type: string
+          enum: [materialized_view, live]
+          description: top_problematic_10 hangi kaynaktan geldi
+        top_refreshed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: MV kaynağında son yenileme zamanı (live ise null)
         top_problematic_10:
           type: array
           maxItems: 10
@@ -1151,6 +1165,10 @@ paths:
           `MTBF = (vardiya süresi - duruş) / arıza sayısı`
           `Availability = (vardiya süresi - duruş) / vardiya süresi`
 
+        `top_problematic_10` varsayılan olarak **materyalize view**'dan okunur
+        (1M satırda 106 ms → 0,06 ms). Birkaç saniye bayat olabilir; tazelik
+        `top_refreshed_at` ile bildirilir. `fresh=true` ile canlı sorguya düşülür.
+
         `equipment_id` verilmezse tesis geneli hesaplanır.
         Metrikler **anlık** hesaplanır; geçmiş olay güncellenirse yansır.
       security: [{ bearerAuth: [] }]
@@ -1165,6 +1183,13 @@ paths:
           required: false
           description: Analiz penceresi (gün). 1–3650.
           schema: { type: integer, minimum: 1, maximum: 3650, default: 30 }
+        - name: fresh
+          in: query
+          required: false
+          description: |
+            `true` verilirse en problemli 10 listesi materyalize view yerine
+            canlı sorgudan hesaplanır. Bayat veriden şüphelenildiğinde kaçış yolu.
+          schema: { type: boolean, default: false }
       responses:
         '200':
           description: Metrikler
@@ -1290,8 +1315,11 @@ paths:
       summary: Denetim kayıtları (yalnızca yönetici)
       description: |
         Tablo **append-only**'dir: `BEFORE UPDATE OR DELETE` trigger'ı
-        `RAISE EXCEPTION` atar. Son 100 kayıt, en yeni önce.
+        `RAISE EXCEPTION` atar. Keyset sayfalama (`limit`, `cursor`).
       security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
       responses:
         '200':
           description: Kayıtlar
@@ -1307,5 +1335,64 @@ paths:
                     old_data: null
                     new_data: { path: /api/v1/work-orders, status: 201 }
                     created_at: '2026-10-25T22:37:31Z'
+                next_cursor: 45
+                has_more: true
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ── Rapor altyapısı (materyalize view) ────────────────────────────────────
+  /api/v1/admin/refresh-metrics:
+    get:
+      tags: [Metrik]
+      summary: Rapor görünümünün tazeliği
+      description: |
+        "En Problemli 10 Ekipman" raporu materyalize view'dan okunur.
+        Bu uç, raporun ne kadar bayat olduğunu söyler; arayüz "son güncelleme"
+        etiketi basabilir. `ready=false` ise view henüz oluşmamış demektir.
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Tazelik durumu
+          content:
+            application/json:
+              example:
+                view: mv_equipment_wo_stats
+                ready: true
+                refreshed_at: '2026-10-26T15:12:32Z'
+                age_seconds: 93
+                duration_ms: 31
+                row_count: 1793
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Metrik]
+      summary: Rapor görünümünü yenile
+      description: |
+        `REFRESH MATERIALIZED VIEW CONCURRENTLY` çalıştırır. Transaction bloğu
+        içinde çalışamadığı için otomatik tetiklenmez; toplu değişiklikten sonra
+        (seed, gece işi) açıkça çağrılır.
+
+        Neden otomatik değil: her iş emri yazımında refresh, 1M satırda ~96 ms
+        maliyeti yazma yoluna eklerdi.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Yenilendi
+          content:
+            application/json:
+              example:
+                view: mv_equipment_wo_stats
+                row_count: 1793
+                duration_ms: 25
+                refreshed_at: '2026-10-26T15:14:05Z'
+        '400': { $ref: '#/components/responses/IdempotencyKeyRequired' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500':
+          description: REFRESH_FAILED
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }

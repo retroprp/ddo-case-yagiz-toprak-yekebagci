@@ -55,6 +55,10 @@ var criticalIdempotencyRoutes = map[string]bool{
 
 	"POST /api/v1/downtime-events":       true,
 	"PATCH /api/v1/downtime-events/{id}": true,
+
+	// Rapor altyapısı: yenileme bir yazma işlemi, idempotent olması gerek
+	// (aynı anahtarla tekrar gelirse ikinci REFRESH çalışmasın).
+	"POST /api/v1/admin/refresh-metrics": true,
 }
 
 // RequireIdempotencyKey, kritik uçlarda Idempotency-Key başlığını zorunlu kılar.

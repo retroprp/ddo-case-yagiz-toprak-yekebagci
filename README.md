@@ -162,6 +162,13 @@ Değiştirici metotlarda (POST/PATCH/DELETE) **kritik uçlarda `Idempotency-Key`
 |---|---|---|---|
 | `GET` | `/api/v1/audit-logs` | yonetici | Append-only (trigger korumalı) |
 
+### Rapor altyapısı
+
+| Metot | Yol | Roller | Not |
+|---|---|---|---|
+| `POST` | `/api/v1/admin/refresh-metrics` | yonetici | Materyalize view yenileme (`Idempotency-Key` zorunlu) |
+| `GET` | `/api/v1/admin/refresh-metrics` | yonetici | Raporun tazeliği (`age_seconds`, `refreshed_at`) |
+
 Tam istek koleksiyonu: [`requests.http`](requests.http) — 5 rol token'ı, 51 istek, hazır assertion'lar.
 
 ---
@@ -289,23 +296,55 @@ sızdırır ve N+1 riski getirir. Ayrıntı: [`DECISIONS.md`](DECISIONS.md).
 | Sorgu | Plan | Süre |
 |---|---|---|
 | Ekipman ağacı + roll-up | Recursive Union + Index Only Scan | ~41 ms |
-| En problemli 10 ekipman | Hash Join + HashAggregate | ~3,7 ms |
-| Keyset sayfalama (`id < $1 LIMIT 50`) | Index Scan Backward | ~0,05 ms |
+| Keyset sayfalama (`id < $1 LIMIT 11`) | Index Only Scan Backward | ~0,05 ms |
+| Keyset sayfalama (`OFFSET 5500 LIMIT 11`) | Index Only Scan, **5511 satır okundu** | ~1,7 ms |
+
+> OFFSET satırları okur ve atar; keyset doğrudan başlar. 6.000 satırda 6× fark,
+> 1 milyon satırda 10.000. sayfa için ~900×.
 
 ### 1.000.000 iş emri ile ölçek testi
 
+Materyalize view `mv_equipment_wo_stats` (migration `003`), raporu
+"En Problemli 10 Ekipman" için kullanılır.
+
 | Yaklaşım | Plan | Süre |
 |---|---|---|
-| Doğrudan `work_orders` taraması | Parallel Seq Scan | **114 ms** |
-| Materyalize view + `REFRESH` | MV üzerinden okuma | **1,1 ms** (refresh maliyeti 85 ms) |
+| Doğrudan `work_orders` taraması | Parallel Seq Scan (3 worker) | **106 ms** |
+| **Materyalize view** + sıralama indeksi | Index Scan (`mv_..._rank_idx`) → 10 satır | **0,06 ms** |
+| `REFRESH ... CONCURRENTLY` maliyeti | 1M satır agregasyonu | **96 ms** |
 
-**Yorum:** Mevcut `idx_wo_equipment_type_status (equipment_id, wo_type, status)` indeksi
-roll-up sorgusunda **Index Only Scan** ile kullanılıyor (heap fetch 0), ancak "en problemli
-10 ekipman" raporunda `WHERE wo_type = ... AND status <> ...` öneki olmadığı için tarama
-planına düşüyor. 6.000 satırda bu fark önemsiz (3,7 ms); 1 milyon satırda rapor ucunun
-materyalize view üzerinden okunması ~100× kazanç sağlıyor. Rapor ucu için doğru takas bu;
-gerçek zamansal doğruluk gerektiren uçlar (iş emri listesi, stok) doğrudan tablodan okumaya
-devam ediyor.
+**~1.800× hız farkı.** MV sorgusu sıralama indeksi sayesinde LIMIT 10'a
+ulaştığında duruyor; tüm görünümü taramıyor.
+
+Doğruluk: canlı sorgu ile MV sonucu 1.006.000 satırda **birebir aynı**
+(`EXCEPT` ile iki yönde 0 fark).
+
+### Neden materyalize view, neden indeks yetmedi?
+
+Mevcut `idx_wo_equipment_type_status (equipment_id, wo_type, status)` indeksi
+roll-up sorgusunda **Index Only Scan** ile kullanılıyor (`Heap Fetches: 0`),
+ama rapor sorgusunda kullanılamıyor: öneki `equipment_id` olan indekste
+`wo_type` ve `status` yalnızca eşitlik koşulu olarak kullanılabilir, filtre
+olarak değil. Sorgu `WHERE wo_type = ... AND status <> ...` dediği için
+tarama planına düşüyor.
+
+**Takas:** MV birkaç saniye bayat olabilir. Bu kabul edilebilir çünkü rapor
+bir yönetim ekranı, işlem ucu değil. Tazelik görünür ve kontrol edilebilir:
+
+```bash
+# Raporu canlı sorguyla al (MV'yi atla)
+GET /api/v1/metrics/reliability?days=30&fresh=true
+
+# MV'yi yenile (yalnızca yönetici, Idempotency-Key zorunlu)
+POST /api/v1/admin/refresh-metrics
+
+# Raporun ne kadar taze olduğunu öğren
+GET /api/v1/admin/refresh-metrics
+# → {"ready":true,"age_seconds":93,"refreshed_at":"...","row_count":1793}
+```
+
+Seed sonrası simülatör view'ı otomatik yeniler; aksi hâlde rapor boş kalırdı
+(view migration sırasında, veri yokken oluşturuluyor).
 
 ---
 

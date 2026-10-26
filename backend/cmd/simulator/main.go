@@ -354,6 +354,17 @@ func runDeterministicSeed(ctx context.Context, pool *pgxpool.Pool, seed int64) e
 		return err
 	}
 
+	// Seed sonrası materyalize view'ı yenile. Aksi hâlde "En Problemli 10"
+	// raporu boş kalır: view, migration sırasında (veri yokken) oluşturuldu.
+	// REFRESH ... CONCURRENTLY transaction içinde çalışmaz, bu yüzden
+	// commit'ten SONRA, ayrı cümle olarak çağrılıyor.
+	var mvRows int64
+	if err := pool.QueryRow(ctx, `SELECT refresh_mv_equipment_wo_stats()`).Scan(&mvRows); err != nil {
+		slog.Warn("materyalize view yenilenemedi", "error", err)
+	} else {
+		slog.Info("mv_equipment_wo_stats yenilendi", "rows", mvRows)
+	}
+
 	slog.Info("deterministic seed completed!",
 		"equipments", len(eqRows),
 		"work_orders", len(woRows),

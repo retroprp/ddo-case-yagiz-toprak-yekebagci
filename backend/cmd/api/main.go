@@ -81,6 +81,7 @@ func main() {
 	maintHandler := handlers.NewMaintenanceHandler(pool)
 	metricsHandler := handlers.NewMetricsHandler(pool)
 	lifecycleHandler := handlers.NewWorkOrderLifecycleHandler(pool)
+	metricsAdminHandler := handlers.NewMetricsAdminHandler(pool)
 
 	extractUserID := func(r *http.Request) *int {
 		if claims, ok := auth.GetUserFromContext(r.Context()); ok && claims != nil {
@@ -144,6 +145,12 @@ func main() {
 
 			// Denetim Kaydı
 			protected.With(auth.RequireRoles("yonetici")).Get("/audit-logs", authHandler.ListAuditLogs)
+
+			// Rapor altyapısı: materyalize view yenileme ve tazelik durumu.
+			// REFRESH ... CONCURRENTLY transaction içinde çalışmaz, bu yüzden
+			// yalnızca açık çağrıyla tetiklenir (otomatik değil).
+			protected.With(auth.RequireRoles("yonetici")).Get("/admin/refresh-metrics", metricsAdminHandler.RefreshState)
+			protected.With(auth.RequireRoles("yonetici")).Post("/admin/refresh-metrics", metricsAdminHandler.RefreshMetrics)
 		})
 	})
 

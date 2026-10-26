@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"log/slog"
 	"math"
 	"net/http"
 	"sort"
@@ -12,6 +13,7 @@ import (
 	"bakimplan/internal/middleware"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -272,19 +274,48 @@ func (h *MetricsHandler) GetReliabilityMetrics(w http.ResponseWriter, r *http.Re
 		availability = (operatingHours / totalScheduledHours) * 100.0
 	}
 
-	// Görev 4: En Problemli 10 Ekipman Raporu (Composite Index idx_wo_equipment_type_status kullanır)
-	topRows, err := h.Pool.Query(ctx, `
-		SELECT 
-			e.id, e.code, e.name, e.level_type,
-			COUNT(w.id) AS failure_wo_count,
-			COALESCE(SUM(w.labor_cost_kurus + w.parts_cost_kurus), 0)::BIGINT AS total_cost_kurus
-		FROM equipments e
-		JOIN work_orders w ON w.equipment_id = e.id
-		WHERE w.wo_type = 'corrective' AND w.status != 'iptal'
-		GROUP BY e.id, e.code, e.name, e.level_type
-		ORDER BY failure_wo_count DESC, total_cost_kurus DESC
-		LIMIT 10;
-	`)
+	// Görev 4: En Problemli 10 Ekipman raporu.
+	//
+	// Kaynak: materyalize view (mv_equipment_wo_stats) — varsayılan.
+	// Neden: doğrudan work_orders taraması 1M satırda ~114 ms, MV ~1,1 ms.
+	// Gecikme kabul edilebilir çünkü bu bir yönetim raporu, işlem ucu değil.
+	//
+	// `?fresh=true` verilirse canlı sorguya düşer: MV bayatsa (yenileme
+	// unutulmuşsa) doğru sayıyı görmek için kaçış yolu. Bu, "MV var ama
+	// veri eski" durumunu sessiz bir yanlış cevaba dönüştürmemek için.
+	useMV := r.URL.Query().Get("fresh") != "true"
+
+	var topRows pgx.Rows
+	if useMV {
+		topRows, err = h.Pool.Query(ctx, `
+			SELECT
+				e.id, e.code, e.name, e.level_type,
+				m.failure_wo_count,
+				m.total_cost_kurus
+			FROM equipments e
+			JOIN mv_equipment_wo_stats m ON m.equipment_id = e.id
+			WHERE m.failure_wo_count > 0
+			ORDER BY m.failure_wo_count DESC, m.total_cost_kurus DESC
+			LIMIT 10`)
+		if err != nil {
+			// View henüz oluşmamış olabilir (migration sırası); canlı sorguya düş.
+			slog.Warn("mv_equipment_wo_stats okunamadı, canlı sorguya düşülüyor", "error", err)
+			useMV = false
+		}
+	}
+	if !useMV {
+		topRows, err = h.Pool.Query(ctx, `
+			SELECT
+				e.id, e.code, e.name, e.level_type,
+				COUNT(w.id) AS failure_wo_count,
+				COALESCE(SUM(w.labor_cost_kurus + w.parts_cost_kurus), 0)::BIGINT AS total_cost_kurus
+			FROM equipments e
+			JOIN work_orders w ON w.equipment_id = e.id
+			WHERE w.wo_type = 'corrective' AND w.status != 'iptal'
+			GROUP BY e.id, e.code, e.name, e.level_type
+			ORDER BY failure_wo_count DESC, total_cost_kurus DESC
+			LIMIT 10`)
+	}
 	var topProblematic []map[string]any
 	if err == nil {
 		defer topRows.Close()
@@ -308,6 +339,17 @@ func (h *MetricsHandler) GetReliabilityMetrics(w http.ResponseWriter, r *http.Re
 		topProblematic = []map[string]any{}
 	}
 
+	// Raporun kaynağını ve tazeliğini yanıtta göstermek, "bu sayı nereden
+	// geldi" sorusunu arayüzde cevaplanabilir kılıyor.
+	topSource := "live"
+	var mvRefreshedAt *time.Time
+	if useMV {
+		topSource = "materialized_view"
+		_ = h.Pool.QueryRow(ctx,
+			`SELECT refreshed_at FROM metrics_refresh_state WHERE name = 'mv_equipment_wo_stats'`,
+		).Scan(&mvRefreshedAt)
+	}
+
 	middleware.WriteJSON(w, http.StatusOK, map[string]any{
 		"equipment_id":          eqFilter,
 		"window_days":           days,
@@ -323,6 +365,8 @@ func (h *MetricsHandler) GetReliabilityMetrics(w http.ResponseWriter, r *http.Re
 		"mttr_hours":            math.Round(mttr*100) / 100,
 		"availability_percent":  math.Round(availability*100) / 100,
 		"top_problematic_10":    topProblematic,
+		"top_source":            topSource,
+		"top_refreshed_at":      mvRefreshedAt,
 	})
 }
 
