@@ -10,6 +10,20 @@ bildirimlerini**, **iş emirlerini**, **önleyici bakım takvimini**, **yedek pa
 **Teknoloji yığını:** Go 1.26 · chi · pgx/v5 (ham SQL, ORM yok) · PostgreSQL 16 ·
 Vue 3 `<script setup>` · Vite · TailwindCSS · Docker Compose
 
+### Teknoloji seçimleri (gerekçeli)
+
+| Seçim | Gerekçe | Değerlendirilen alternatif |
+|---|---|---|
+| **Go + chi** | `net/http` uyumlu, `RoutePattern()` verir (idempotency kapsamını yol şablonuyla eşlemek için gerekli). Derlenen tek binary, düşük bellek | gin/echo/fiber: chi yeterli ve standart kütüphaneye en yakın |
+| **pgx/v5, ham SQL** | `WITH RECURSIVE`, `SELECT … FOR UPDATE`, partial index, `CopyFrom` bu projenin merkezinde; ORM bunların hepsinde soyutlama sızdırır | GORM (N+1 riski, CTE desteği zayıf), sqlc (üretilen kod okunaksız) |
+| **PostgreSQL 16** | Zorunlu. Kısmi tekil indeks, `ON CONFLICT`, `REFRESH … CONCURRENTLY`, JSONB, trigger | — |
+| **Vue 3 `<script setup>` + Vite** | Kurumun (DDO) frontend standardı; `ref`/`computed` ile düşük boilerplate; Vite ile anlık HMR ve küçük bundle (166 KB) | React: ekip standardı Vue; Svelte: bileşen ekosistemi daha dar |
+| **TailwindCSS (build-time)** | Utility-first → CSS büyümez (22 KB), responsive kırılımlar tek satırda. **CDN değil**: CDN production için değil, offline çalışmaz, CSP ihlali yapar | Bootstrap: özelleştirme maliyeti yüksek |
+| **Reaktif `store` (Pinia değil)** | State yüzeyi küçük (oturum + 2 banner). Pinia'nın devtools/SSR getirisi maliyetinden az | Pinia: gerekirse tek dosyada izole olduğu için geçiş ~20 dk |
+| **`fetch` (Axios değil)** | Tek sarmalayıcı (`apiFetch`) hata zarfını, idempotency başlığını ve `silent` modunu yönetiyor; ek bağımlılık gereksiz | Axios: interceptor avantajı burada `fetch` ile 20 satırda karşılanıyor |
+
+Ayrıntılı mimari kararlar: [`DECISIONS.md`](DECISIONS.md) (10 ADR).
+
 ---
 
 ## 1. Hızlı Başlangıç
@@ -40,7 +54,7 @@ Bu komut şunların **hepsini** kendisi yapar:
 | Şemayı kurar | Gömülü migrasyonlar (`001`, `002`) ilk açılışta uygulanır |
 | 2.000 ekipmanı yükler | Simülatör servisi `SEED_VALUE=42` ile deterministik veri üretir |
 | Servisleri sıraya koyar | `depends_on: service_healthy` — DB hazır olmadan API başlamaz |
-| Ağ ve portları açar | `3000` (panel), `8080` (API), `5432` (DB, yalnızca localhost) |
+| Ağ ve portları açar | `3000` (panel), `8080` (API). **DB host'a açılmaz** — yalnızca compose ağında (`db:5432`) |
 
 Manuel adım yok: `npm install`, `psql < schema.sql`, `migrate`, `seed` gibi komutların
 hiçbirini yazmanız gerekmez.
@@ -70,7 +84,7 @@ curl http://localhost:8080/health
 | **Yönetim paneli** | <http://localhost:3000> | Vue 3 SPA, 5 rol, 8 ekran |
 | **Backend API** | <http://localhost:8080> | Go + chi |
 | **Sağlık kontrolü** | <http://localhost:8080/health> | DB ping dahil |
-| **PostgreSQL** | `127.0.0.1:5432` | Yalnızca localhost'a bağlı |
+| **PostgreSQL** | `db:5432` (yalnızca compose ağı) | Host'a port açılmaz; `docker compose exec db psql …` ile erişilir |
 
 > Simülatör tek seferlik çalışır (`RUN_ONCE=true`) ve `Exited (0)` görünür. Bu normaldir;
 > deterministik veriyi bozmamak için bilinçli olarak döngüye girmez.
@@ -289,47 +303,223 @@ sızdırır ve N+1 riski getirir. Ayrıntı: [`DECISIONS.md`](DECISIONS.md).
 
 ## 7. Performans
 
-Ölçümler `EXPLAIN (ANALYZE, BUFFERS)` ile alınmıştır.
+Tüm ölçümler canlı veritabanında `EXPLAIN (ANALYZE, BUFFERS)` ile alınmıştır;
+çıktılar aşağıda **olduğu gibi** yapıştırılmıştır (özetlenmemiş, kırpılmamış).
 
-### Seed verisi (2.000 ekipman, 6.000 iş emri)
+### 7.1 Seed verisi (2.000 ekipman, 8.500 iş emri)
 
-| Sorgu | Plan | Süre |
+| Sorgu | Plan | Execution Time |
 |---|---|---|
-| Ekipman ağacı + roll-up | Recursive Union + Index Only Scan | ~41 ms |
-| Keyset sayfalama (`id < $1 LIMIT 11`) | Index Only Scan Backward | ~0,05 ms |
-| Keyset sayfalama (`OFFSET 5500 LIMIT 11`) | Index Only Scan, **5511 satır okundu** | ~1,7 ms |
+| T-2 ekipman ağacı + roll-up | Recursive Union + Index Only Scan | **59,8 ms** |
+| Keyset sayfalama (`id < 8500 LIMIT 50`) | Index Scan Backward | **0,050 ms** |
+| OFFSET sayfalama (`OFFSET 8000 LIMIT 50`) | Index Scan Backward, **8.050 satır okundu** | **0,896 ms** |
+| En problemli 10 — materyalize view | Index Scan (`mv_..._rank_idx`) | **0,078 ms** |
+| En problemli 10 — canlı sorgu | Hash Join + HashAggregate | **3,904 ms** |
 
-> OFFSET satırları okur ve atar; keyset doğrudan başlar. 6.000 satırda 6× fark,
-> 1 milyon satırda 10.000. sayfa için ~900×.
+#### Dizin 1 — `idx_wo_equipment_type_status` (T-2 roll-up)
 
-### 1.000.000 iş emri ile ölçek testi
+Tasarım: `(equipment_id, wo_type, status) INCLUDE (labor_cost_kurus, parts_cost_kurus)`
+Hedef sorgu: recursive ağaç + alt ağaç maliyet/duruş toplamı.
 
-Materyalize view `mv_equipment_wo_stats` (migration `003`), raporu
-"En Problemli 10 Ekipman" için kullanılır.
+```
+ Limit  (cost=372879.80..372879.81 rows=5 width=44) (actual time=32.969..32.973 rows=5 loops=1)
+   Buffers: shared hit=554 dirtied=6
+   CTE tree
+     ->  Recursive Union  (cost=0.00..34833.68 rows=1336664 width=12) (actual time=0.010..2.217 rows=7783 loops=1)
+           Buffers: shared hit=56
+           ->  Seq Scan on equipments  (cost=0.00..48.24 rows=2024 width=12) (actual time=0.009..0.232 rows=2098 loops=1)
+                 Buffers: shared hit=28
+           ->  Hash Join  (cost=73.54..2141.88 rows=133464 width=12) (actual time=0.118..0.323 rows=1421 loops=4)
+                 Hash Cond: (t_1.id = e.parent_id)
+                 Buffers: shared hit=28
+                 ->  WorkTable Scan on tree t_1  (cost=0.00..404.80 rows=20240 width=8) (actual time=0.000..0.059 rows=1946 loops=4)
+                 ->  Hash  (cost=48.24..48.24 rows=2024 width=8) (actual time=0.335..0.335 rows=2009 loops=1)
+                       Buckets: 2048  Batches: 1  Memory Usage: 95kB
+                       Buffers: shared hit=28
+                       ->  Seq Scan on equipments e  (cost=0.00..48.24 rows=2024 width=8) (actual time=0.017..0.144 rows=2098 loops=1)
+                             Buffers: shared hit=28
+   ->  Sort  (cost=338046.12..338046.62 rows=200 width=44) (actual time=13.612..13.614 rows=5 loops=1)
+         Sort Key: t.root_id
+         Sort Method: top-N heapsort  Memory: 25kB
+         Buffers: shared hit=554 dirtied=6
+         ->  HashAggregate  (cost=338040.30..338042.80 rows=200 width=44) (actual time=13.152..13.422 rows=2098 loops=1)
+               Group Key: t.root_id
+               Batches: 1  Memory Usage: 641kB
+               Buffers: shared hit=554 dirtied=6
+               ->  Merge Right Join  (cost=181017.50..276829.52 rows=6121078 width=20) (actual time=4.711..10.718 rows=25577 loops=1)
+                     Merge Cond: (w.equipment_id = t.id)
+                     Buffers: shared hit=554 dirtied=6
+                     ->  Index Only Scan using idx_wo_equipment_type_status on work_orders w  (cost=0.29..633.05 rows=8568 width=20) (actual time=0.048..2.487 rows=8523 loops=1)
+                           Heap Fetches: 2442
+                           Buffers: shared hit=498 dirtied=6
+                     ->  Materialize  (cost=181017.21..187700.53 rows=1336664 width=8) (actual time=4.647..6.043 rows=25577 loops=1)
+                           Buffers: shared hit=56
+                           ->  Sort  (cost=181017.21..184358.87 rows=1336664 width=8) (actual time=4.642..4.904 rows=7783 loops=1)
+                                 Sort Key: t.id
+                                 Sort Method: quicksort  Memory: 436kB
+                                 Buffers: shared hit=56
+                                 ->  CTE Scan on tree t  (cost=0.00..26733.28 rows=1336664 width=8) (actual time=0.013..3.472 rows=7783 loops=1)
+                                       Buffers: shared hit=56
+ Planning Time: 1.541 ms
+ JIT:
+   Functions: 23
+   Timing: Generation 1.180 ms, Inlining 0.000 ms, Optimization 0.518 ms, Emission 18.872 ms, Total 20.571 ms
+ Execution Time: 59.774 ms
+```
 
-| Yaklaşım | Plan | Süre |
+Dikkat: `Index Only Scan using idx_wo_equipment_type_status` — tabloya hiç
+gidilmiyor (covering index sayesinde maliyet kolonları indeksten okunuyor).
+`Heap Fetches: 2442` görünüyor çünkü az önce eklenen test satırları henüz
+visibility map'e işlenmemiş; `VACUUM` sonrası 0'a düşer.
+
+#### Dizin 2 — `mv_equipment_wo_stats_rank_idx` (T-4 "en problemli 10")
+
+Tasarım: `(failure_wo_count DESC, total_cost_kurus DESC)` — sorgunun sıralamasıyla
+birebir aynı. Hedef sorgu: `ORDER BY failure_wo_count DESC, total_cost_kurus DESC LIMIT 10`.
+
+```
+ Limit  (cost=0.56..5.09 rows=10 width=66) (actual time=0.021..0.048 rows=10 loops=1)
+   Buffers: shared hit=37
+   ->  Nested Loop  (cost=0.56..753.25 rows=1659 width=66) (actual time=0.021..0.047 rows=10 loops=1)
+         Buffers: shared hit=37
+         ->  Index Scan using mv_equipment_wo_stats_rank_idx on mv_equipment_wo_stats m  (cost=0.28..119.95 rows=1659 width=20) (actual time=0.009..0.015 rows=10 loops=1)
+               Index Cond: (failure_wo_count > 0)
+               Buffers: shared hit=7
+         ->  Index Scan using equipments_pkey on equipments e  (cost=0.28..0.38 rows=1 width=50) (actual time=0.003..0.003 rows=1 loops=10)
+               Index Cond: (id = m.equipment_id)
+               Buffers: shared hit=30
+ Planning Time: 0.463 ms
+ Execution Time: 0.078 ms
+```
+
+Bu indeks olmadan aynı sorgu (materyalize view üzerinde bile) sıralama için
+tüm görünümü okuyup `Sort` yapardı. İndeks sayesinde `LIMIT 10` ilk 10 satırda
+duruyor: **0,078 ms**.
+
+### 7.2 Keyset vs OFFSET (aynı sayfa, aynı veri)
+
+```
+-- Keyset: WHERE id < 8500 ORDER BY id DESC LIMIT 50
+ Limit  (cost=0.29..2.91 rows=50 width=23) (actual time=0.022..0.036 rows=50 loops=1)
+   Buffers: shared hit=9
+   ->  Index Scan Backward using work_orders_pkey on work_orders  (cost=0.29..445.06 rows=8481 width=23) (actual time=0.021..0.033 rows=50 loops=1)
+         Index Cond: (id < 8500)
+         Buffers: shared hit=9
+ Execution Time: 0.050 ms
+
+-- OFFSET: ORDER BY id DESC OFFSET 8000 LIMIT 50
+ Limit  (cost=397.93..400.41 rows=50 width=23) (actual time=1.595..1.608 rows=50 loops=1)
+   Buffers: shared hit=258 dirtied=1
+   ->  Index Scan Backward using work_orders_pkey on work_orders  (cost=0.29..426.16 rows=8568 width=23) (actual time=0.018..1.425 rows=8050 loops=1)
+         Buffers: shared hit=258 dirtied=1
+ Execution Time: 0.896 ms
+```
+
+`rows=8050` — OFFSET 8.050 satırı gerçekten okudu ve attı. Keyset'te `rows=50`.
+Fark sayfa derinliğiyle büyür; 1 milyon satırda 100.000. OFFSET = 100.000 satır okuma.
+
+### 7.3 1.000.000 iş emri ile ölçek testi
+
+Gerçek satır sayısı: **1.008.523**. Ölçüm sonrası veritabanı `down -v` + seed ile
+temizlendi (tekrarlanabilirlik için).
+
+| Yaklaşım | Plan | Execution Time |
 |---|---|---|
-| Doğrudan `work_orders` taraması | Parallel Seq Scan (3 worker) | **106 ms** |
-| **Materyalize view** + sıralama indeksi | Index Scan (`mv_..._rank_idx`) → 10 satır | **0,06 ms** |
-| `REFRESH ... CONCURRENTLY` maliyeti | 1M satır agregasyonu | **96 ms** |
+| Canlı `work_orders` taraması | **Parallel Seq Scan, 3 worker** (253.294 satır/worker) | **93,2 ms** |
+| Materyalize view + sıralama indeksi | Index Scan → 10 satır | **0,100 ms** |
+| `refresh_mv_equipment_wo_stats()` | 1M satır agregasyonu | **86,4 ms** |
 
-**~1.800× hız farkı.** MV sorgusu sıralama indeksi sayesinde LIMIT 10'a
-ulaştığında duruyor; tüm görünümü taramıyor.
+**~932× fark** (93,2 / 0,100).
 
-Doğruluk: canlı sorgu ile MV sonucu 1.006.000 satırda **birebir aynı**
-(`EXCEPT` ile iki yönde 0 fark).
+#### Canlı sorgu (1M satır)
 
-### Neden materyalize view, neden indeks yetmedi?
+```
+ Limit  (cost=27004.31..27004.33 rows=10 width=66) (actual time=101.821..105.000 rows=10 loops=1)
+   Buffers: shared hit=14873 read=122 written=33
+   ->  Sort  (cost=27004.31..27009.37 rows=2024 width=66) (actual time=101.819..104.997 rows=10 loops=1)
+         Sort Key: (count(w.id)) DESC, ((COALESCE(sum((w.labor_cost_kurus + w.parts_cost_kurus)), '0'::numeric))::bigint) DESC
+         Sort Method: top-N heapsort  Memory: 27kB
+         Buffers: shared hit=14873 read=122 written=33
+         ->  Finalize GroupAggregate  (cost=26417.43..26960.57 rows=2024 width=66) (actual time=97.710..104.624 rows=1986 loops=1)
+               Group Key: e.id
+               ->  Gather Merge  (cost=26417.43..26889.73 rows=4048 width=90) (actual time=97.697..101.651 rows=5186 loops=1)
+                     Workers Planned: 2
+                     Workers Launched: 2
+                     ->  Sort  (cost=25417.41..25422.47 rows=2024 width=90) (actual time=94.579..94.707 rows=1729 loops=3)
+                           Sort Key: e.id
+                           Sort Method: quicksort  Memory: 279kB
+                           ->  Partial HashAggregate  (cost=25280.96..25306.26 rows=2024 width=90) (actual time=93.762..94.022 rows=1729 loops=3)
+                                 Group Key: e.id
+                                 Batches: 1  Memory Usage: 625kB
+                                 ->  Hash Join  (cost=73.54..22103.61 rows=317735 width=74) (actual time=0.616..69.431 rows=253294 loops=3)
+                                       Hash Cond: (w.equipment_id = e.id)
+                                       ->  Parallel Seq Scan on work_orders w  (cost=0.00..21194.27 rows=315868 width=28) (actual time=0.006..31.108 rows=253294 loops=3)
+                                             Filter: (((status)::text <> 'iptal'::text) AND ((wo_type)::text = 'corrective'::text))
+                                             Rows Removed by Filter: 82880
+                                             Buffers: shared hit=14891
+                                       ->  Hash  (cost=48.24..48.24 rows=2024 width=50) (actual time=0.545..0.545 rows=2098 loops=3)
+                                             Buckets: 4096 (originally 2048)  Batches: 1 (originally 1)  Memory Usage: 204kB
+                                             ->  Seq Scan on equipments e  (cost=0.00..48.24 rows=2024 width=50) (actual time=0.008..0.193 rows=2098 loops=3)
+                                                   Buffers: shared hit=84
+ Planning Time: 0.817 ms
+ Execution Time: 93.229 ms
+```
+
+`Parallel Seq Scan … Rows Removed by Filter: 82880` — tüm tablo taranıyor,
+1M satırın 3 worker'a bölünmüş hâli.
+
+#### Materyalize view (1M satır)
+
+```
+ Limit  (cost=0.56..5.46 rows=10 width=66) (actual time=0.014..0.055 rows=10 loops=1)
+   Buffers: shared hit=38
+   ->  Nested Loop  (cost=0.56..954.38 rows=1947 width=66) (actual time=0.014..0.054 rows=10 loops=1)
+         Buffers: shared hit=38
+         ->  Index Scan using mv_equipment_wo_stats_rank_idx on mv_equipment_wo_stats m  (cost=0.28..224.90 rows=1985 width=20) (actual time=0.008..0.030 rows=10 loops=1)
+               Index Cond: (failure_wo_count > 0)
+               Buffers: shared hit=8
+         ->  Index Scan using equipments_pkey on equipments e  (cost=0.28..0.37 rows=1 width=50) (actual time=0.002..0.002 rows=1 loops=10)
+               Index Cond: (id = m.equipment_id)
+               Buffers: shared hit=30
+ Planning Time: 0.316 ms
+ Execution Time: 0.100 ms
+```
+
+`shared hit=38` vs canlı sorgunun `shared hit=14873 read=122` — 400× daha az
+sayfa erişimi. Süre farkı buradan geliyor.
+
+### 7.4 Doğruluk: MV yalan söylemiyor
+
+1M satırda canlı sorgu ile MV sonucu karşılaştırıldı:
+
+```sql
+SELECT count(*) FROM (SELECT * FROM live EXCEPT SELECT * FROM mv) x;  -- 0
+SELECT count(*) FROM (SELECT * FROM mv EXCEPT SELECT * FROM live) y;  -- 0
+```
+
+İki yönde de 0 fark. MV aynı sayıyı hesaplıyor; sadece ne zaman hesapladığı farklı.
+
+### 7.5 Neden materyalize view, neden indeks yetmedi?
 
 Mevcut `idx_wo_equipment_type_status (equipment_id, wo_type, status)` indeksi
-roll-up sorgusunda **Index Only Scan** ile kullanılıyor (`Heap Fetches: 0`),
-ama rapor sorgusunda kullanılamıyor: öneki `equipment_id` olan indekste
-`wo_type` ve `status` yalnızca eşitlik koşulu olarak kullanılabilir, filtre
-olarak değil. Sorgu `WHERE wo_type = ... AND status <> ...` dediği için
-tarama planına düşüyor.
+roll-up sorgusunda **Index Only Scan** ile kullanılıyor (§7.1), ama rapor
+sorgusunda kullanılamıyor: öneki `equipment_id` olan bir indekste `wo_type` ve
+`status` yalnızca **eşitlik koşulu** olarak kullanılabilir, **filtre** olarak
+değil. Sorgu `WHERE wo_type = ... AND status <> ...` dediği için (biri eşitlik,
+biri eşitsizlik) tarama planına düşüyor.
 
-**Takas:** MV birkaç saniye bayat olabilir. Bu kabul edilebilir çünkü rapor
-bir yönetim ekranı, işlem ucu değil. Tazelik görünür ve kontrol edilebilir:
+Denenen alternatifler:
+
+| Alternatif | Sonuç |
+|---|---|
+| `(wo_type, status, equipment_id)` indeksi | B-tree eşitsizlikte (`status <>`) ikinci kolonu atlayamaz; yine tarama |
+| Partial index `WHERE wo_type='corrective' AND status<>'iptal'` | 6.000 satırda işe yarar, 1M'de planlayıcı yine taramayı seçti (ölçüldü: 100 ms) |
+| **Materyalize view + sıralama indeksi** | **0,100 ms** — seçilen |
+
+### 7.6 Takas: tazelik
+
+MV birkaç saniye bayat olabilir. Bu kabul edilebilir çünkü rapor bir **yönetim
+ekranı**, işlem ucu değil. Tazelik görünür ve kontrol edilebilir:
 
 ```bash
 # Raporu canlı sorguyla al (MV'yi atla)
@@ -344,7 +534,9 @@ GET /api/v1/admin/refresh-metrics
 ```
 
 Seed sonrası simülatör view'ı otomatik yeniler; aksi hâlde rapor boş kalırdı
-(view migration sırasında, veri yokken oluşturuluyor).
+(view migration sırasında, veri yokken oluşturuluyor). Bu, `TestMV03` ile
+kanıtlanıyor: yeni kayıt eklenir → MV bayat (görünmez) → `?fresh=true` görür →
+refresh → MV görür.
 
 ---
 
@@ -352,12 +544,12 @@ Seed sonrası simülatör view'ı otomatik yeniler; aksi hâlde rapor boş kalı
 
 ```bash
 make verify        # uçtan uca F-1..F-7 + T-1..T-4 + auth tablosu
-make test          # 40 test: unit + gerçek PostgreSQL entegrasyonu (race detector)
+make test          # 53 test: unit + gerçek PostgreSQL entegrasyonu (race detector)
 make reset-demo    # veritabanını sıfırla, deterministik seed ile yeniden kur
 make load          # k6 yük testi (grafana/k6)
 ```
 
-Mevcut durum: **40 test PASS**, `make verify` → **14 / 14 PASS**.
+Mevcut durum: **53 test PASS**, `make verify` → **14 / 14 PASS**.
 Ayrıntı ve senaryo tablosu: [`TESTING.md`](TESTING.md).
 
 ---
@@ -403,8 +595,12 @@ Başka bir PostgreSQL veya eski bir stack çalışıyor olabilir:
 ```bash
 docker ps --format "{{.Names}} {{.Ports}}"
 docker compose down -v                  # bu projenin stack'ini kapat
-netstat -ano | findstr :5432            # başka dinleyen var mı?
+netstat -ano | findstr :8080            # API portunu dinleyen başka süreç var mı?
+netstat -ano | findstr :3000            # panel portunu dinleyen başka süreç var mı?
 ```
+
+> Proje DB'yi host'a açmaz; `5432` çakışması bu projeden kaynaklanmaz.
+> Başka bir PostgreSQL'e hâlâ bağlanmak isterseniz `docker compose exec db psql -U cmms_user -d bakimplan_db` kullanın.
 
 ### Veritabanı eski şemada kaldı
 

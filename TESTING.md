@@ -62,11 +62,15 @@ için "benim makinemde çalışıyordu" durumunu ortadan kaldırır.
 
 ```bash
 make test
-# veya:
-cd backend && go test -v -race ./...
+# eşdeğeri (DB host'a port açmadığı için testler compose ağında koşar):
+docker compose --profile test run --rm test
 ```
 
-**40 test**, üç kategori:
+> Testler `test` servisinde, imajın Go araç zincirini içeren `builder`
+> katmanında çalışır ve `db:5432` üzerinden bağlanır. `-race` bayrağı cgo
+> gerektirdiği için servis içinde `gcc` kurulur.
+
+**53 test**, beş kategori:
 
 | Kategori | Adet | Veritabanı | Ne sınar |
 |---|---|---|---|
@@ -74,6 +78,10 @@ cd backend && go test -v -race ./...
 | `TestIntegration*` | 16 | ✅ gerçek PostgreSQL | Uçlar + SQL davranışı |
 | `TestLifecycle*` | 6 | ✅ | Durum makinesi, atama, geçmiş |
 | `TestIdemKey*` | 4 | ✅ | Idempotency zorunluluğu ve kapsamı |
+| `TestPaging*` | 7 | ✅ | Keyset sayfalama: tekrar yok, tam gezinme, sınır durumu |
+| `TestMV*` | 6 | ✅ | Materyalize view: kaynak seçimi, bayatlama, refresh, RBAC |
+
+**39 test gerçek PostgreSQL'e bağlanır** (spec: en az 10 entegrasyon testi).
 
 Veritabanı erişilemezse entegrasyon testleri **`SKIP`** olur, `FAIL` olmaz. Bu bilinçli:
 CI'da PostgreSQL servis olarak tanımlı, yerelde yoksa testler yine anlamlı çalışır.
@@ -123,6 +131,36 @@ sınır durumları (bitişik aralıklar `[10,12]` + `[12,14]` → `[10,14]`) bur
 
 `TestIdemKey01` anahtarsız → 400 `IDEMPOTENCY_KEY_REQUIRED`.
 `02` anahtarlı → 201. `03` GET etkilenmez. `04` kapsam 6 farklı kritik uçta doğrulanır.
+
+### Sayfalama testleri (7) — `paging_test.go`
+
+| Test | Kanıtladığı |
+|---|---|
+| `TestPaging01_BasicPage` | `limit` uygulanır, `has_more` + `next_cursor` tutarlı |
+| `02_NoDuplicateAcrossPages` | Sayfalar arası kayıt **tekrar etmez** |
+| `03_FullTraversal` | Tüm sayfalar gezilince kayıp yok (50/50 parça) |
+| `04_LastPageHasNoCursor` | Son sayfada `next_cursor` null |
+| `05_InvalidParams` | Bozuk `cursor`/`limit` → 400 `INVALID_CURSOR` |
+| `06_LimitIsCapped` | `limit=5000` → 200'e kırpılır |
+| `07_AllPaginatedEndpoints` | 5 uç da aynı sözleşmeye uyar |
+
+**Neden bu testler önemli:** Sayfalama hataları **sessizdir**. Aynı kayıt iki
+sayfada görünür veya son kayıt hiç gelmez; kimse fark etmez. Test, tüm sayfaları
+gezip benzersizlik sayarak bunu yakalar.
+
+### Materyalize view testleri (6) — `metrics_mv_test.go`
+
+| Test | Kanıtladığı |
+|---|---|
+| `TestMV01_ReportUsesMaterializedView` | Varsayılan kaynak `materialized_view` |
+| `02_FreshParamFallsBackToLive` | `?fresh=true` → `live` |
+| `03_StaleUntilRefresh` | **Bayatlama senaryosu**: yeni kayıt → MV görmez → fresh görür → refresh → MV görür |
+| `04_RefreshRequiresManager` | Teknisyen refresh edemez (403) |
+| `05_RefreshRequiresIdempotencyKey` | Anahtarsız refresh → 400 |
+| `06_RefreshStateReportsFreshness` | Tazelik ucu anlamlı değer döner |
+
+`TestMV03` bu grubun kalbi: materyalize view'ın **tek tehlikeli özelliği**
+sessiz bayatlamadır. Test, bayatlığı ve yenilemeyi açıkça kanıtlar.
 
 ### Race detector
 
@@ -211,6 +249,31 @@ curl -s -X POST $BASE/api/v1/work-orders \
 # Aynı isteği aynı anahtarla tekrar → X-Idempotent-Replay: true
 ```
 
+### 5.3 Arayüzde elle denenecek senaryolar
+
+Tarayıcıda <http://localhost:3000> açılır. Her senaryo 2-3 dakika sürer.
+
+| # | Adım | Beklenen |
+|---|---|---|
+| 1 | Giriş ekranı açılır | Header'da **rol değiştirme butonu yok**; 5 demo hesap listelenir |
+| 2 | "Depo Sorumlusu"na tıkla → **Giriş Yap** | Sol menüde yalnızca **2 ekran**: Ekipman Ağacı, Yedek Parça & Depo |
+| 3 | Adres çubuğuna `/audit` yaz | İlk izinli ekrana geri atar (`/equipments`) |
+| 4 | Sol menüde **Yetki Testi** | **İndigo** nötr kutu: "Erişim reddedildi (403) — beklenen … Yetkilendirme doğru çalışıyor." Kırmızı hata **yok** |
+| 5 | **Çıkış** → "Teknisyen" ile giriş | Menüde 7 ekran, **Denetim Kaydı yok** |
+| 6 | **İş Emirleri** → `acik` satırda **Ata** | Modal açılır, teknisyen listesi (aktif iş sayısıyla) gelir; ata → satır `atandi` olur |
+| 7 | Aynı satırda **Başlat** | `atandi → devam_ediyor`, üstte yeşil bilgi kutusu; sonraki durumlar listelenir |
+| 8 | Aynı satırda **Tamamla** | `tamamlandi`; PM bağlıysa "Sonraki PM: …" bilgisi |
+| 9 | Aynı satırda **Geçmiş** | Modal: her geçiş (önce → sonra), zaman, aktör adı ve rolü |
+| 10 | **Arıza Bildirimi** ekranında yeni kayıt | 201, liste başına eklenir |
+| 11 | **Yedek Parça & Depo** → "Daha fazla parça" | 25 → 50 kayıt; buton kaybolur, "liste sonu" yazar |
+| 12 | **Güvenilirlik & MTBF** | 4 KPI kartı + "En Problemli 10" tablosu; `?fresh` farkı API'de |
+| 13 | **Yönetici** ile giriş → **Denetim Kaydı** | Her satır **tek** (mükerrer yok); JSONB alanlar Türkçe etiketli, tarih/kuruş biçimli |
+| 14 | Pencereyi daralt (mobil genişlik) | Menü hamburger'a düşer, tablolar yatay kaydırılır |
+| 15 | Sayfa yenile (F5) | Oturum korunur (token doğrulanır) |
+
+**Kontrol noktaları:** Her ekranda yükleniyor iskeleti, boş durum metni ve
+hata + "tekrar dene" butonu bulunmalı. Konsolda hata olmamalı.
+
 ---
 
 ## 6. Sürekli entegrasyon (CI)
@@ -235,6 +298,7 @@ dosyaları). Test edilmeyen şey bozulur; pipeline'ın kapsamı ürünün kapsam
 |---|---|
 | `make verify` idempotent değil | Aynı DB'de tekrar koşarsan T-2/T-3 düşer → `make reset-demo` |
 | `verify` veriyi değiştirir | Demo DB'sinde çalıştırın; üretimde kullanmayın |
-| Keyset sayfalama | Yalnızca `work-orders`; diğer listeler `LIMIT 100` sabit |
-| 1M satır performansı | Ölçüldü (bkz. README §7); materyalize view henüz kodda değil |
+| 1M satır performansı | Ölçüldü: 93,2 ms → 0,100 ms (README §7.3) |
+| Materyalize view tazeliği | Refresh açık çağrıyla; `age_seconds` ile izlenebilir (README §7.6) |
 | Mobil erişim | `VITE_API_URL` yeniden derleme gerektirir (README §9) |
+| DB host'a port açmaz | Host'tan `go test` çalışmaz; `make test` (Docker) kullanın |

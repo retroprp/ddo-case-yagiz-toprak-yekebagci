@@ -5,8 +5,12 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-cmms_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cmms_secret_pass}
       POSTGRES_DB: ${POSTGRES_DB:-bakimplan_db}
-    ports:
-      - "127.0.0.1:5432:5432"
+    # Host'a port AÇILMAZ: yalnızca compose ağında erişilir (spec §3).
+    # Backend, simulator, verify ve test servisleri "db:5432" ile bağlanır.
+    # Host'tan inceleme gerekirse:
+    #   docker compose exec db psql -U cmms_user -d bakimplan_db
+    expose:
+      - "5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -83,6 +87,33 @@ services:
       - ./loadtest:/scripts:ro
     depends_on:
       backend:
+        condition: service_healthy
+
+  # Otomatik testler (go test -race).
+  #
+  # Neden ayrı servis: DB host'a port açmadığı için host'tan `go test`
+  # localhost:5432'ye bağlanamaz. Testler compose ağında, "db:5432" ile koşar.
+  # Bu, spec'in "veritabanı yalnızca compose ağında erişilsin" kuralıyla uyumlu.
+  #
+  # target: builder — imajın Go araç zincirini içeren ara katmanı kullanılır
+  # (çalışma imajı yalnızca derlenmiş binary'leri taşır, `go test` yapamaz).
+  # gcc: -race bayrağı cgo gerektirir; alpine imajında gcc yok, burada kurulur.
+  test:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: builder
+    profiles: ["test"]
+    working_dir: /src
+    command:
+      - sh
+      - -c
+      - apk add --no-cache gcc musl-dev >/dev/null && go test -race ./...
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://cmms_user:cmms_secret_pass@db:5432/bakimplan_db?sslmode=disable}
+      JWT_SECRET: ${JWT_SECRET:-ddo-super-secret-jwt-key-2026-bakimplan}
+    depends_on:
+      db:
         condition: service_healthy
 
 volumes:

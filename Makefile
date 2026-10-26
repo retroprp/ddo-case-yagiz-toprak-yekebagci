@@ -20,8 +20,10 @@ verify:
 load:
 	docker compose --profile load run --rm k6
 
+# 53 otomatik test (39'u gerçek PostgreSQL), race detector ile.
+# DB host'a port açmadığı için testler compose ağında koşar (bkz. README §11).
 test:
-	cd backend && go test -v -race ./...
+	docker compose --profile test run --rm test
 
 lint:
 	cd backend && go vet ./...
