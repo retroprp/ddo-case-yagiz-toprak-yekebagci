@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -107,6 +108,13 @@ func doLifecycleReq(r http.Handler, method, path, token string, body any) (*http
 		req.Header.Set("Authorization", "Bearer "+token)
 
 	}
+	// Kritik uçlar Idempotency-Key olmadan 400 IDEMPOTENCY_KEY_REQUIRED döner.
+	// Sayaç, eşzamanlı goroutine'lerde anahtar çakışmasını önler
+	// (çakışırsa ikinci istek idempotent "replay" olur ve sayaç testleri yanılır).
+	if method != http.MethodGet && req.Header.Get("Idempotency-Key") == "" {
+		req.Header.Set("Idempotency-Key",
+			fmt.Sprintf("lc-%d-%d", time.Now().UnixNano(), atomic.AddUint64(&lcIdemCounter, 1)))
+	}
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -114,6 +122,9 @@ func doLifecycleReq(r http.Handler, method, path, token string, body any) (*http
 	_ = json.NewDecoder(rec.Body).Decode(&out)
 	return rec, out
 }
+
+// lcIdemCounter, lifecycle testlerinde anahtar üretimi için atomik sayaç.
+var lcIdemCounter uint64
 
 func userIDByRole(t *testing.T, pool *pgxpool.Pool, role string) (int, string) {
 	t.Helper()

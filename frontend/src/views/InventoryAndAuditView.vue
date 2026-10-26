@@ -4,21 +4,70 @@ import { store, apiFetch, formatTL } from '../store'
 
 const props = defineProps({ section: { type: String, default: 'inventory' } })
 
+// Sunucu varsayılanı 50; arayüzde 25 tutup "daha fazla yükle" ile büyütüyoruz.
+const PAGE_SIZE = 25
+
 const partsList = ref([])
 const auditLogs = ref([])
+
+// Keyset sayfalama durumu: her liste kendi imlecini taşır.
+const partsCursor = ref(null)
+const auditCursor = ref(null)
+const partsHasMore = ref(false)
+const auditHasMore = ref(false)
+
+const loading = ref(false)
+const loadingMore = ref(false)
+const loadError = ref('')
+
 const reserveForm = ref({ work_order_id: 1, part_id: 1, warehouse_id: 1, quantity: 1 })
 const stockForm = ref({ part_id: 1, warehouse_id: 1, quantity_change: 10, movement_type: 'purchase' })
 
-async function loadData() {
+// append=false → ilk sayfa (listeyi sıfırla)
+// append=true  → sonraki sayfa (mevcut listenin sonuna ekle)
+//
+// Neden birleştirme? Kullanıcı kaydırdıkça liste büyümeli; her sayfada
+// öncekileri kaybetmek "geri gitme" hissi verir.
+async function loadData(append = false) {
+  if (append) {
+    loadingMore.value = true
+  } else {
+    loading.value = true
+    loadError.value = ''
+  }
+
   try {
     if (props.section === 'inventory') {
-      const res = await apiFetch('/parts')
-      partsList.value = res.items || []
+      const params = new URLSearchParams({ limit: String(PAGE_SIZE) })
+      const cursor = append ? partsCursor.value : null
+      if (cursor) params.set('cursor', String(cursor))
+
+      const res = await apiFetch(`/parts?${params.toString()}`)
+      const page = res.items || []
+      partsList.value = append ? [...partsList.value, ...page] : page
+      partsCursor.value = res.next_cursor ?? null
+      partsHasMore.value = Boolean(res.has_more)
     } else if (props.section === 'audit') {
-      const res = await apiFetch('/audit-logs')
-      auditLogs.value = res.items || []
+      const params = new URLSearchParams({ limit: String(PAGE_SIZE) })
+      const cursor = append ? auditCursor.value : null
+      if (cursor) params.set('cursor', String(cursor))
+
+      const res = await apiFetch(`/audit-logs?${params.toString()}`)
+      const page = res.items || []
+      auditLogs.value = append ? [...auditLogs.value, ...page] : page
+      auditCursor.value = res.next_cursor ?? null
+      auditHasMore.value = Boolean(res.has_more)
     }
-  } catch (_) {}
+  } catch (err) {
+    loadError.value = err.message
+    if (!append) {
+      partsList.value = []
+      auditLogs.value = []
+    }
+  } finally {
+    loading.value = false
+    loadingMore.value = false
+  }
 }
 
 async function submitReservePart() {
@@ -52,8 +101,8 @@ async function submitStockMovement() {
   } catch (_) {}
 }
 
-watch(() => props.section, loadData)
-onMounted(loadData)
+watch(() => props.section, () => loadData())
+onMounted(() => loadData())
 </script>
 
 <template>
@@ -61,7 +110,19 @@ onMounted(loadData)
     <div class="lg:col-span-2 bg-white rounded-xl border border-slate-200 shadow-sm p-4">
       <h2 class="text-base font-bold text-slate-800 mb-1">Yedek Parça Stoğu (Stok = Hareketlerin Toplamı - T-3)</h2>
       <p class="text-xs text-slate-500 mb-3">Eşzamanlı rezervasyonlar <code>SELECT ... FOR UPDATE</code> satır kilidiyle korunur; kritik parçada sıfır stok uyarısı verilir.</p>
-      <div v-if="partsList.length === 0" class="p-6 text-center text-slate-400 text-xs">Parça bulunamadı.</div>
+
+      <!-- Yükleniyor / hata: sayfalama eklendiği için liste boş görünümü
+           "yükleniyor" ile karışmasın diye ayrı durumlar gösteriliyor. -->
+      <div v-if="loading" class="flex items-center gap-2 p-6 text-xs text-slate-500">
+        <span class="animate-spin inline-block w-4 h-4 border-2 border-emerald-600 border-t-transparent rounded-full"></span>
+        Parçalar yükleniyor...
+      </div>
+      <div v-else-if="loadError" class="p-4 text-xs text-red-800 bg-red-50 border border-red-200 rounded-lg">
+        <p class="font-bold mb-1">Liste alınamadı</p>
+        <p class="font-mono">{{ loadError }}</p>
+        <button @click="loadData()" class="mt-2 px-3 py-1.5 rounded bg-red-600 text-white font-semibold">Tekrar dene</button>
+      </div>
+      <div v-else-if="partsList.length === 0" class="p-6 text-center text-slate-400 text-xs">Parça bulunamadı.</div>
       <div v-else class="overflow-x-auto">
         <table class="w-full text-xs text-left">
           <thead class="bg-slate-50 text-slate-600 uppercase border-b">
@@ -95,6 +156,23 @@ onMounted(loadData)
           </tbody>
         </table>
       </div>
+
+      <!-- Keyset sayfalama: sunucu "daha var mı" bilgisini has_more ile verir,
+           arayüz tahmin etmez. -->
+      <div v-if="partsHasMore" class="pt-3 text-center">
+        <button
+          @click="loadData(true)"
+          :disabled="loadingMore"
+          class="text-xs px-3 py-1.5 rounded-lg border border-slate-300 font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+        >
+          {{ loadingMore ? 'Yükleniyor...' : 'Daha fazla parça' }}
+        </button>
+      </div>
+      <p class="pt-2 text-[10px] text-slate-400 text-center">
+        {{ partsList.length }} parça gösteriliyor
+        <span v-if="partsHasMore"> · devamı var (cursor: {{ partsCursor }})</span>
+        <span v-else> · liste sonu</span>
+      </p>
     </div>
 
     <div class="space-y-4">
@@ -124,7 +202,16 @@ onMounted(loadData)
   <div v-else-if="section === 'audit'" class="bg-white rounded-xl border border-slate-200 shadow-sm p-4">
     <h2 class="text-base font-bold text-slate-800 mb-1">Denetim Kaydı (Append-Only Audit Logs)</h2>
     <p class="text-xs text-slate-500 mb-3">Durum değiştiren tüm işlemlerde kim, ne zaman, hangi kaydı, eski ve yeni JSONB değerleriyle değiştirdi kaydedilir.</p>
-    <div v-if="auditLogs.length === 0" class="p-6 text-center text-slate-400 text-xs">Henüz denetim kaydı yok.</div>
+    <div v-if="loading" class="flex items-center gap-2 p-6 text-xs text-slate-500">
+      <span class="animate-spin inline-block w-4 h-4 border-2 border-emerald-600 border-t-transparent rounded-full"></span>
+      Denetim kayıtları yükleniyor...
+    </div>
+    <div v-else-if="loadError" class="p-4 text-xs text-red-800 bg-red-50 border border-red-200 rounded-lg">
+      <p class="font-bold mb-1">Liste alınamadı</p>
+      <p class="font-mono">{{ loadError }}</p>
+      <button @click="loadData()" class="mt-2 px-3 py-1.5 rounded bg-red-600 text-white font-semibold">Tekrar dene</button>
+    </div>
+    <div v-else-if="auditLogs.length === 0" class="p-6 text-center text-slate-400 text-xs">Henüz denetim kaydı yok.</div>
     <div v-else class="overflow-x-auto">
       <table class="w-full text-xs text-left">
         <thead class="bg-slate-50 text-slate-600 uppercase border-b">
@@ -147,5 +234,20 @@ onMounted(loadData)
         </tbody>
       </table>
     </div>
+
+    <div v-if="auditHasMore" class="pt-3 text-center">
+      <button
+        @click="loadData(true)"
+        :disabled="loadingMore"
+        class="text-xs px-3 py-1.5 rounded-lg border border-slate-300 font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+      >
+        {{ loadingMore ? 'Yükleniyor...' : 'Daha fazla kayıt' }}
+      </button>
+    </div>
+    <p v-if="!loading && !loadError" class="pt-2 text-[10px] text-slate-400 text-center">
+      {{ auditLogs.length }} kayıt gösteriliyor
+      <span v-if="auditHasMore"> · devamı var (cursor: {{ auditCursor }})</span>
+      <span v-else> · liste sonu</span>
+    </p>
   </div>
 </template>

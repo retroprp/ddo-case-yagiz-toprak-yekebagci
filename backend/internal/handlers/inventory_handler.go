@@ -53,6 +53,15 @@ func (h *InventoryHandler) ListWarehouses(w http.ResponseWriter, r *http.Request
 
 // ListParts: Stok = hareketlerin toplamı kuralına göre tüm parçaların fiziksel, rezerve ve kullanılabilir stoklarını ve uyarıları döner.
 func (h *InventoryHandler) ListParts(w http.ResponseWriter, r *http.Request) {
+	limit, cursor, err := parsePageParams(r, defaultPageLimit, maxPageLimit)
+	if err != nil {
+		middleware.WriteError(w, http.StatusBadRequest, "INVALID_CURSOR", err.Error())
+		return
+	}
+
+	// CTE'ler tüm parçalar için agregasyon yapar (parça sayısı kadardır),
+	// filtre/limit ise dış sorguda uygulanır. Bu sayede stok toplamları
+	// sayfalanmış alt kümede eksik hesaplanmaz.
 	query := `
 	WITH mov AS (
 		SELECT part_id, COALESCE(SUM(quantity_change), 0)::INT AS physical_stock
@@ -73,10 +82,12 @@ func (h *InventoryHandler) ListParts(w http.ResponseWriter, r *http.Request) {
 	FROM parts p
 	LEFT JOIN mov m ON m.part_id = p.id
 	LEFT JOIN res r ON r.part_id = p.id
-	ORDER BY p.id ASC;
+	WHERE ($1::bigint IS NULL OR p.id > $1)
+	ORDER BY p.id ASC
+	LIMIT $2;
 	`
 
-	rows, err := h.Pool.Query(r.Context(), query)
+	rows, err := h.Pool.Query(r.Context(), query, cursor, limit+1)
 	if err != nil {
 		middleware.WriteError(w, http.StatusInternalServerError, "DB_ERROR", err.Error())
 		return
@@ -108,11 +119,13 @@ func (h *InventoryHandler) ListParts(w http.ResponseWriter, r *http.Request) {
 			"critical_zero_warning": isCritical && available <= 0,
 		})
 	}
-	if items == nil {
-		items = []map[string]any{}
-	}
 
-	middleware.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+	items, next, hasMore := trimPage(items, limit, func(m map[string]any) int64 { return int64(m["id"].(int)) })
+	middleware.WriteJSON(w, http.StatusOK, map[string]any{
+		"items":       items,
+		"next_cursor": next,
+		"has_more":    hasMore,
+	})
 }
 
 type addStockMovementReq struct {

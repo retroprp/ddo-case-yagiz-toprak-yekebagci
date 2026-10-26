@@ -148,19 +148,27 @@ async function loadList(append = false) {
       const res = await apiFetch(`/work-orders?${params.toString()}`)
       const page = res.items || []
       items.value = append ? [...items.value, ...page] : page
-      nextCursor.value = page.length === pageSize ? res.next_cursor : null
+      nextCursor.value = res.has_more ? res.next_cursor : null
       return
     }
 
     if (props.section === 'failures') {
-      const res = await apiFetch('/failure-reports')
-      items.value = res.items || []
+      const params = new URLSearchParams({ limit: String(pageSize) })
+      if (append && nextCursor.value) params.set('cursor', String(nextCursor.value))
+      const res = await apiFetch(`/failure-reports?${params.toString()}`)
+      const page = res.items || []
+      items.value = append ? [...items.value, ...page] : page
+      nextCursor.value = res.has_more ? res.next_cursor : null
       return
     }
 
     if (props.section === 'pm') {
-      const res = await apiFetch('/preventive-plans')
-      items.value = res.items || []
+      const params = new URLSearchParams({ limit: String(pageSize) })
+      if (append && nextCursor.value) params.set('cursor', String(nextCursor.value))
+      const res = await apiFetch(`/preventive-plans?${params.toString()}`)
+      const page = res.items || []
+      items.value = append ? [...items.value, ...page] : page
+      nextCursor.value = res.has_more ? res.next_cursor : null
       return
     }
 
@@ -609,6 +617,16 @@ onMounted(refresh)
             </div>
             <div class="text-[11px] text-slate-500 mt-1">{{ row.equipment_name }}</div>
           </div>
+
+          <!-- Sayfalama: sunucu has_more döndürmedikçe buton görünmez. -->
+          <div v-if="nextCursor" class="pt-2 text-center">
+            <button @click="loadList(true)" class="text-xs px-3 py-1.5 rounded-lg border border-slate-300 font-semibold text-slate-700 hover:bg-slate-50">
+              Daha fazla arıza kaydı
+            </button>
+          </div>
+          <p class="text-[10px] text-slate-400 text-center">
+            {{ items.length }} kayıt gösteriliyor · keyset sayfalama
+          </p>
         </div>
 
         <!-- PM planları -->
@@ -647,8 +665,20 @@ onMounted(refresh)
               </tbody>
             </table>
           </div>
-          <div v-if="canCreatePM" class="pt-2 text-right">
-            <button @click="triggerDue" class="text-xs px-3 py-1.5 rounded-lg bg-indigo-600 text-white font-semibold hover:bg-indigo-700">
+          <div class="pt-2 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <button
+                v-if="nextCursor"
+                @click="loadList(true)"
+                class="text-xs px-3 py-1.5 rounded-lg border border-slate-300 font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                Daha fazla plan
+              </button>
+              <p class="text-[10px] text-slate-400 mt-1">
+                {{ items.length }} plan gösteriliyor · keyset sayfalama
+              </p>
+            </div>
+            <button v-if="canCreatePM" @click="triggerDue" class="text-xs px-3 py-1.5 rounded-lg bg-indigo-600 text-white font-semibold hover:bg-indigo-700">
               Vadesi Gelenleri Üret
             </button>
           </div>

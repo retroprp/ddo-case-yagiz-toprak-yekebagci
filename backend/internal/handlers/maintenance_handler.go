@@ -70,11 +70,22 @@ func (h *MaintenanceHandler) CreateFailureReport(w http.ResponseWriter, r *http.
 }
 
 func (h *MaintenanceHandler) ListFailureReports(w http.ResponseWriter, r *http.Request) {
+	limit, cursor, err := parsePageParams(r, defaultPageLimit, maxPageLimit)
+	if err != nil {
+		middleware.WriteError(w, http.StatusBadRequest, "INVALID_CURSOR", err.Error())
+		return
+	}
+
+	// limit+1: "daha var mı" sorusunu kesin yanıtlamak için bir satır fazla.
+	// cursor NULL ise ($1::bigint IS NULL) koşulu true olur, yani ilk sayfa.
 	rows, err := h.Pool.Query(r.Context(),
 		`SELECT f.id, f.equipment_id, e.name, f.title, f.severity, f.status, f.created_at
 		 FROM failure_reports f
 		 JOIN equipments e ON e.id = f.equipment_id
-		 ORDER BY f.id DESC LIMIT 100`)
+		 WHERE ($1::bigint IS NULL OR f.id < $1)
+		 ORDER BY f.id DESC
+		 LIMIT $2`,
+		cursor, limit+1)
 	if err != nil {
 		middleware.WriteError(w, http.StatusInternalServerError, "DB_ERROR", err.Error())
 		return
@@ -99,23 +110,20 @@ func (h *MaintenanceHandler) ListFailureReports(w http.ResponseWriter, r *http.R
 			})
 		}
 	}
-	if items == nil {
-		items = []map[string]any{}
-	}
-	middleware.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+
+	items, next, hasMore := trimPage(items, limit, func(m map[string]any) int64 { return m["id"].(int64) })
+	middleware.WriteJSON(w, http.StatusOK, map[string]any{
+		"items":       items,
+		"next_cursor": next,
+		"has_more":    hasMore,
+	})
 }
 
 func (h *MaintenanceHandler) ListWorkOrders(w http.ResponseWriter, r *http.Request) {
-	cursorStr := r.URL.Query().Get("cursor")
-	limitStr := r.URL.Query().Get("limit")
-	limit := 50
-	if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 200 {
-		limit = l
-	}
-
-	var cursor int64 = 9223372036854775807
-	if c, err := strconv.ParseInt(cursorStr, 10, 64); err == nil && c > 0 {
-		cursor = c
+	limit, cursor, err := parsePageParams(r, defaultPageLimit, maxPageLimit)
+	if err != nil {
+		middleware.WriteError(w, http.StatusBadRequest, "INVALID_CURSOR", err.Error())
+		return
 	}
 
 	rows, err := h.Pool.Query(r.Context(),
@@ -123,10 +131,10 @@ func (h *MaintenanceHandler) ListWorkOrders(w http.ResponseWriter, r *http.Reque
 		        w.assigned_to, w.labor_cost_kurus, w.parts_cost_kurus, w.created_at
 		 FROM work_orders w
 		 JOIN equipments e ON e.id = w.equipment_id
-		 WHERE w.id < $1
+		 WHERE ($1::bigint IS NULL OR w.id < $1)
 		 ORDER BY w.id DESC
 		 LIMIT $2`,
-		cursor, limit,
+		cursor, limit+1,
 	)
 	if err != nil {
 		middleware.WriteError(w, http.StatusInternalServerError, "DB_ERROR", err.Error())
@@ -135,7 +143,6 @@ func (h *MaintenanceHandler) ListWorkOrders(w http.ResponseWriter, r *http.Reque
 	defer rows.Close()
 
 	var items []map[string]any
-	var nextCursor *int64
 	for rows.Next() {
 		var id int64
 		var eqID int
@@ -158,17 +165,14 @@ func (h *MaintenanceHandler) ListWorkOrders(w http.ResponseWriter, r *http.Reque
 				"parts_cost_kurus": partsCost,
 				"created_at":       createdAt,
 			})
-			idCopy := id
-			nextCursor = &idCopy
 		}
 	}
-	if items == nil {
-		items = []map[string]any{}
-	}
 
+	items, next, hasMore := trimPage(items, limit, func(m map[string]any) int64 { return m["id"].(int64) })
 	middleware.WriteJSON(w, http.StatusOK, map[string]any{
 		"items":       items,
-		"next_cursor": nextCursor,
+		"next_cursor": next,
+		"has_more":    hasMore,
 	})
 }
 
@@ -424,11 +428,20 @@ func (h *MaintenanceHandler) CreatePMPlan(w http.ResponseWriter, r *http.Request
 }
 
 func (h *MaintenanceHandler) ListPMPlans(w http.ResponseWriter, r *http.Request) {
+	limit, cursor, err := parsePageParams(r, defaultPageLimit, maxPageLimit)
+	if err != nil {
+		middleware.WriteError(w, http.StatusBadRequest, "INVALID_CURSOR", err.Error())
+		return
+	}
+
 	rows, err := h.Pool.Query(r.Context(),
 		`SELECT p.id, p.equipment_id, e.name, p.name, p.plan_type, p.interval_days, p.interval_hours, p.calc_basis, p.next_due_at, p.next_due_meter
 		 FROM preventive_plans p
 		 JOIN equipments e ON e.id = p.equipment_id
-		 ORDER BY p.id ASC`)
+		 WHERE ($1::bigint IS NULL OR p.id > $1)
+		 ORDER BY p.id ASC
+		 LIMIT $2`,
+		cursor, limit+1)
 	if err != nil {
 		middleware.WriteError(w, http.StatusInternalServerError, "DB_ERROR", err.Error())
 		return
@@ -456,10 +469,13 @@ func (h *MaintenanceHandler) ListPMPlans(w http.ResponseWriter, r *http.Request)
 			})
 		}
 	}
-	if items == nil {
-		items = []map[string]any{}
-	}
-	middleware.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+
+	items, next, hasMore := trimPage(items, limit, func(m map[string]any) int64 { return int64(m["id"].(int)) })
+	middleware.WriteJSON(w, http.StatusOK, map[string]any{
+		"items":       items,
+		"next_cursor": next,
+		"has_more":    hasMore,
+	})
 }
 
 type meterReadingReq struct {

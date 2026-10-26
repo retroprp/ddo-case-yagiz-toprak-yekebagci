@@ -115,9 +115,19 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AuthHandler) ListAuditLogs(w http.ResponseWriter, r *http.Request) {
+	limit, cursor, err := parsePageParams(r, defaultPageLimit, maxPageLimit)
+	if err != nil {
+		middleware.WriteError(w, http.StatusBadRequest, "INVALID_CURSOR", err.Error())
+		return
+	}
+
 	rows, err := h.Pool.Query(r.Context(),
 		`SELECT id, user_id, action, entity_type, entity_id, old_data, new_data, created_at
-		 FROM audit_logs ORDER BY id DESC LIMIT 100`)
+		 FROM audit_logs
+		 WHERE ($1::bigint IS NULL OR id < $1)
+		 ORDER BY id DESC
+		 LIMIT $2`,
+		cursor, limit+1)
 	if err != nil {
 		middleware.WriteError(w, http.StatusInternalServerError, "DB_ERROR", err.Error())
 		return
@@ -144,8 +154,11 @@ func (h *AuthHandler) ListAuditLogs(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-	if logs == nil {
-		logs = []map[string]any{}
-	}
-	middleware.WriteJSON(w, http.StatusOK, map[string]any{"items": logs})
+
+	logs, next, hasMore := trimPage(logs, limit, func(m map[string]any) int64 { return m["id"].(int64) })
+	middleware.WriteJSON(w, http.StatusOK, map[string]any{
+		"items":       logs,
+		"next_cursor": next,
+		"has_more":    hasMore,
+	})
 }
