@@ -86,8 +86,11 @@ curl http://localhost:8080/health
 | **Sağlık kontrolü** | <http://localhost:8080/health> | DB ping dahil |
 | **PostgreSQL** | `db:5432` (yalnızca compose ağı) | Host'a port açılmaz; `docker compose exec db psql …` ile erişilir |
 
-> Simülatör tek seferlik çalışır (`RUN_ONCE=true`) ve `Exited (0)` görünür. Bu normaldir;
-> deterministik veriyi bozmamak için bilinçli olarak döngüye girmez.
+> **Simülatör artık ayakta kalır.** Seed bittikten sonra kapanmaz; 5 saniyede bir
+> `simulator_state` tablosuna "hâlâ çalışıyorum" sinyali (heartbeat) yazar.
+> Bu sayede arayüzdeki **Canlı Sistem** rozeti gerçek durumu gösterir
+> (`Canlı · 3 sn`), ama üretilen veri **değişmez** — determinizm korunur.
+> Durumu API'den de okuyabilirsiniz: `GET /api/v1/simulator/status`.
 
 ---
 
@@ -183,6 +186,31 @@ Değiştirici metotlarda (POST/PATCH/DELETE) **kritik uçlarda `Idempotency-Key`
 | `POST` | `/api/v1/admin/refresh-metrics` | yonetici | Materyalize view yenileme (`Idempotency-Key` zorunlu) |
 | `GET` | `/api/v1/admin/refresh-metrics` | yonetici | Raporun tazeliği (`age_seconds`, `refreshed_at`) |
 
+### Simülatör durumu
+
+| Metot | Yol | Roller | Not |
+|---|---|---|---|
+| `GET` | `/api/v1/simulator/status` | tüm oturumlar | Canlılık sinyali: `running`, `age_seconds`, `ticks`, `mode`, `seed` |
+
+Örnek yanıt:
+
+```json
+{
+  "running": true,
+  "mode": "deterministic",
+  "seed": 42,
+  "ticks": 570,
+  "last_tick": "2026-10-26T18:35:12.482Z",
+  "age_seconds": 1,
+  "stale_after_s": 30
+}
+```
+
+Arayüz bu ucu 5 saniyede bir okur ve üst bardaki rozeti günceller. Sinyal 30
+saniyeden eskiyse rozet **"Simülatör bekliyor"** olur — yanlış "canlı" izlenimi
+verilmez. Yanıtın `ticks` alanı her 5 saniyede bir artar; bu, servisin gerçekten
+ayakta olduğunun kanıtıdır.
+
 Tam istek koleksiyonu: [`requests.http`](requests.http) — 5 rol token'ı, 51 istek, hazır assertion'lar.
 
 ---
@@ -224,12 +252,19 @@ Sık karşılaşılan kodlar:
 ┌──────────────┐    HTTP/JSON     ┌──────────────┐    pgx     ┌──────────────┐
 │  Vue 3 SPA   │ ───────────────▶ │  Go API      │ ─────────▶ │ PostgreSQL16 │
 │  nginx:8080  │ ◀─────────────── │  chi:8080    │ ◀───────── │  :5432       │
-└──────────────┘                  └──────────────┘            └──────────────┘
-                                         ▲
-                                         │ CopyFrom (bulk)
-                                  ┌──────┴───────┐
-                                  │  simulator   │  tek seferlik, SEED_VALUE=42
-                                  └──────────────┘
+└──────────────┘                  └──────▲───────┘            └──────▲───────┘
+       │                                 │                           │
+       │  GET /simulator/status          │                    CopyFrom (bulk,
+       │  (rozet, 5 sn'de bir)           │                     yalnızca ilk kurulum)
+       │                                 │                           │
+       └─────────────┐            ┌──────┴───────────────────────────┴──────┐
+                     └───────────▶│  simulator  (SEED_VALUE=42)             │
+                                  │  seed biter → heartbeat döngüsü (5 sn)  │
+                                  └────────────────┬────────────────────────┘
+                                                   │ SELECT / UPDATE
+                                                   ▼
+                                          [simulator_state]
+                                          (mode, seed, ticks, last_tick)
 ```
 
 ### Klasör yapısı
@@ -552,6 +587,20 @@ make load          # k6 yük testi (grafana/k6)
 Mevcut durum: **53 test PASS**, `make verify` → **14 / 14 PASS**.
 Ayrıntı ve senaryo tablosu: [`TESTING.md`](TESTING.md).
 
+### Testler neden ayrı bir veritabanında koşar?
+
+Testler kendi ekipman/iş emri/stok kayıtlarını oluşturur ve silmez. Bunlar demo
+veritabanına yazıldığında her koşu ağaca yeni sahte düğümler ekliyordu
+(`EQ-IDEM-…`, `EQ-MV-…`, `TES-T2-…`) ve arayüzdeki ekipman hiyerarşisi
+şişiyordu. Bu yüzden:
+
+- `test` servisi **`db_test`** konteynerine bağlanır (`bakimplan_test` veritabanı),
+- `db_test` **`tmpfs`** kullanır: veri bellekte durur, konteyner silinince sıfırlanır,
+- normal `docker compose up` bu servisi **hiç başlatmaz** (`profiles: ["test"]`).
+
+Sonuç: testler istediği kadar veri yazsın, **demo verisi değişmez**.
+`docker compose --profile test down` ile test konteynerini temizleyebilirsiniz.
+
 ---
 
 ## 9. Telefondan (Mobil) Erişim
@@ -676,10 +725,17 @@ Seviye kuralı: `tesis → hat → makine → bilesen`. Makine doğrudan tesis a
 |---|---|---|
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | cmms_user / cmms_secret_pass / bakimplan_db | DB kimliği |
 | `DATABASE_URL` | `postgres://…@db:5432/bakimplan_db` | API ve simülatör bağlantısı |
+| — | `bakimplan_test` (`db_test`) | **Yalnızca testler**; ayrı konteyner, bellekte (`tmpfs`), demo veriyle ilgisiz |
 | `JWT_SECRET` | demo değeri | **Üretimde değiştirin** |
 | `SEED_VALUE` | `42` | Simülatör determinizm tohumu |
-| `VITE_API_URL` | `http://localhost:8080/api/v1` | Tarayıcının göreceği API adresi (build arg) |
+| `VITE_API_URL` | `http://localhost:8080/api/v1` | Tarayıcının göreceği API adresi (**build arg** — değişince `--build` gerekir) |
 | `K6_API_URL` | `http://backend:8080` | Yük testi hedefi |
+
+`VITE_API_URL` **derleme anında** JavaScript'in içine gömülür (Vite kuralı). Bu yüzden:
+
+- değeri değiştirdikten sonra `docker compose up -d --build frontend` şarttır,
+- `docker compose restart frontend` **işe yaramaz** (eski JS servis edilmeye devam eder),
+- doğrulamak için: `docker compose exec frontend sh -c "grep -o 'http://[a-z0-9.:]*/api/v1' /usr/share/nginx/html/assets/*.js | head -1"`
 
 `.env` dosyası git'e girmez (`.gitignore`'da). Dosya bulunmazsa `docker-compose.yml`
 içindeki `${VAR:-varsayılan}` değerleri kullanılır; yani sistem `.env` olmadan da
@@ -695,6 +751,270 @@ içindeki `${VAR:-varsayılan}` değerleri kullanılır; yani sistem `.env` olma
 | [`TESTING.md`](TESTING.md) | Test stratejisi, senaryo tablosu, kanıtlar |
 | [`openapi.yaml`](openapi.yaml) | OpenAPI 3.0 sözleşmesi |
 | [`requests.http`](requests.http) | VS Code REST Client koleksiyonu |
+
+---
+
+## Doğrulama Soruları
+
+### 1. En zorlandığın görev hangisiydi? Hangi alternatif çözümleri düşündün ve neden eledin?
+
+**Kısa cevap:** T-3 — yedek parça rezervasyonunda eşzamanlılık. Korunması gereken
+değişmez (invariant) şu:
+
+```
+sum(rezerve edilmiş miktar) + yeni istek  ≤  depodaki fiziksel stok
+```
+
+Naif akışta yarış (race) var: iki istek aynı anda `available = 5` okur, ikisi de
+5 rezerve eder → **10 rezerve, 5 stok**. Stok "eksiye" düşmez ama taahhüt edilen
+miktar fiziksel stoğu aşar; üretimde bu, bakımın ortasında parça bulunamamasıdır.
+
+**Denediğim/elediğim alternatifler:**
+
+| Alternatif | Neden eledim |
+|---|---|
+| Go tarafında `sync.Mutex` | Yalnızca tek süreçte çalışır. API iki replikaya çıktığında veya yeniden başladığında koruma tamamen kaybolur — sessizce bozulan bir çözüm |
+| `SERIALIZABLE` izolasyon | Doğru, ama çakışmada `40001` hatası döner; istemciye yeniden deneme döngüsü yazmak gerekir. Kullanıcıya "stok yok" (409) yerine anlamsız "tekrar deneyin" göstermek istemedim |
+| `parts` tablosuna `version` kolonu (optimistic) | Ek kolon + her istekte retry. Aynı parçaya yük binince boşa giden denemeler artar |
+| PostgreSQL advisory lock | Çalışır, ama kilit anahtarını elle yönetmek gerekir; satır kimliğine bağlı olmadığı için yanlış anahtar seçme riski var |
+| Redis / harici kilit | Yeni bir altyapı bileşeni; bu projenin kapsamı ve "tek komutla ayağa kalkma" şartı için fazla |
+
+**Seçtiğim çözüm:** İşlem (transaction) içinde parça satırını kilitlemek:
+
+```sql
+SELECT unit_cost_kurus, reorder_point, is_critical FROM parts WHERE id = $1 FOR UPDATE
+```
+
+Aynı parçaya gelen istekler burada sıraya girer; stok okuması, rezervasyon
+toplamı ve `INSERT` aynı işlemde olduğu için kontrol ile yazma arasında boşluk
+kalmaz. Ölü kilit (deadlock) riski yok: her istek **tek** satırı kilitler.
+Yetersiz stokta temiz bir `409 INSUFFICIENT_STOCK` döner.
+
+**Kanıt (T-3):** 15 eşzamanlı istek, stok tam 5 adet:
+
+```
+T-3 | PASS | 118ms | 15 eşzamanlı istekten tam 5 kabul (201), 10 stok reddi (409) aldı — aşım 0!
+```
+
+Aynı fikrin T-1'deki karşılığı: "aynı PM planı için ikinci açık iş emri
+oluşmasın" kuralı uygulama kodunda değil, **veritabanında** kısmi tekil indeksle
+korunuyor (`uq_active_pm_work_order`). Uygulama hatalı olsa bile veritabanı
+ikinci kaydı reddeder.
+
+---
+
+### 2. Çözümün kırıldığı ya da yetersiz kaldığı bir senaryo bul ve nedenini açıkla
+
+**Kısa cevap:** "En Problemli 10 Ekipman" raporu **bayat** olabilir. Yeni bir
+arıza iş emri açıldığında rapor, materyalize view yenilenene kadar onu göstermez.
+
+**Somut senaryo:** Teknisyen arıza bildirir → iş emri kapanır → yönetici raporu
+açar. Rapor hâlâ eski sayıları gösterir. Sebep bilinçli bir takas: canlı
+agregasyon 1M satırda **93,2 ms**, materyalize view **0,100 ms** (§7.3). Her
+yazma işleminde view'i yenilemek, yazma gecikmesini ~100 ms'ye çıkarırdı.
+
+**Neden kabul edilebilir:** Bayatlık gizlenmiyor, ölçülüp gösteriliyor:
+
+```bash
+GET /api/v1/admin/refresh-metrics
+# {"ready":true,"age_seconds":93,"refreshed_at":"...","row_count":1793}
+```
+
+`age_seconds` alanı raporun kaç saniye önce hesaplandığını söyler; yönetici
+`POST /api/v1/admin/refresh-metrics` ile tazeler. `make verify`'ın F-7 adımı da
+raporu bu yolla tazeler.
+
+**Diğer bilinen sınırlar (dürüst liste):**
+
+| Sınır | Sebep |
+|---|---|
+| Keyset sayfalama rastgele sayfaya atlayamaz (`?page=7` yok) | OFFSET derinlikte okuduğu satırları gerçekten okuyup atıyor (ölçüm: `rows=8050`). Hız + tutarlılık için "sonraki sayfa" tercih edildi |
+| Simülatör veriyi sürekli değiştirmez | Determinizm şart: aynı `SEED_VALUE=42` her kurulumda aynı veriyi üretmeli, yoksa `make verify` her koşuda farklı sonuç verir. Bu yüzden "canlılık" yalnızca heartbeat ile gösteriliyor — rozet **sürecin** ayakta olduğunu söyler, verinin değiştiğini değil |
+| `make verify` idempotent değil | Aynı veritabanında iki kez koşarsa T-2/T-3 düşer (test verisi biriktiği için) → `make reset-demo` |
+| Tek kiracılı (single-tenant) | `tenant_id` yok; kurum başına ayrı kurulum varsayılıyor |
+
+---
+
+### 3. Veritabanına eklediğin dizinlerden ikisini seç: hangi sorgu için, dizinsiz/dizinli ölçüm farkı nedir?
+
+Ölçüm yöntemi: indeks **geçici** olarak düşürülüp aynı sorgu ölçüldü, sonra
+geri alındı. PostgreSQL'de DDL işlemseldir, bu yüzden kalıcı bir değişiklik yok:
+
+```sql
+BEGIN;
+DROP INDEX uq_active_pm_work_order;
+EXPLAIN (ANALYZE, COSTS OFF) <sorgu>;
+ROLLBACK;
+```
+
+Her ölçüm 5 kez koşuldu, aşağıdaki değerler **medyan**. Ortam: 6.062 iş emri,
+1.793 materyalize view satırı (demo verisi).
+
+**Dizin 1 — `uq_active_pm_work_order`** (kısmi tekil indeks, T-1)
+Sorgu: "bu PM planı için zaten açık bir iş emri var mı?"
+
+```sql
+SELECT 1 FROM work_orders
+ WHERE preventive_plan_id = 7 AND status IN ('acik','atandi','devam_ediyor');
+```
+
+| | Plan | Süre (medyan) | Buffers |
+|---|---|---|---|
+| **Dizinli** | `Index Only Scan` | **0,056 ms** | **3** |
+| Dizinsiz | `Seq Scan` (145 buffer) | 0,371 ms | 145 |
+
+**~6,6× hızlı, ~48× daha az sayfa okuma.** Yalnızca hız değil: bu indeks aynı
+planda ikinci açık iş emrini **veritabanı seviyesinde** de engelliyor — yani
+hatalı bir kod yolu bile veriyi bozamaz.
+
+**Dizin 2 — `mv_equipment_wo_stats_rank_idx`** (sıralama indeksi, F-7)
+Sorgu: "en problemli 10 ekipman"
+
+```sql
+SELECT equipment_id FROM mv_equipment_wo_stats
+ ORDER BY failure_wo_count DESC, total_cost_kurus DESC LIMIT 10;
+```
+
+| | Plan | Süre (medyan) | Buffers |
+|---|---|---|---|
+| **Dizinli** | `Index Scan` → 10 satırda durur | **0,045 ms** | 12 |
+| Dizinsiz | `Seq Scan` + top-N `Sort` | 0,272 ms | 18 |
+
+**~6× hızlı.** Buradaki kazanç satır sayısıyla büyür: 1M satırda aynı sorgu
+**0,100 ms** (§7.3), canlı tablo taraması **93,2 ms** — çünkü indeks `LIMIT 10`
+dolduğunda taramayı bırakır, dizinsiz planda ise tüm görünüm taranıp sıralanır.
+
+**Ölçümün beni yanılttığı yer (bunu da söylemek gerekir):** üçüncü aday
+`idx_wo_assigned_open` (kısmi indeks, "teknisyenin açık işleri") için aynı testi
+yaptım ve **kazanç çıkmadı**: 6.000 satırda planlayıcı indeksten vazgeçip
+`work_orders_pkey` üzerinde geriye tarama yaptı (0,128 ms indeksli / 0,065 ms
+dizinsiz). Sebep: `assigned_to = 1` satırların yarısına yakınını seçiyor, yani
+filtre seçici değil; 20 satırı bulmak için birincil anahtar üzerinde geriye
+gitmek daha ucuz. İndeks bu boyutta gereksiz, tablo büyüdüğünde gerekli olacak.
+Bu yüzden Q3'ün cevabı olarak **kazancı ölçülmüş** iki indeksi seçtim.
+
+---
+
+### 4. Yapay zekâ kullandıysan, reddettiğin ya da düzelttiğin bir çıktıyı (önce/sonra) göster
+
+**Önce (reddedilen):** README §7'de performans tablosu şöyleydi — hiçbir ham
+`EXPLAIN` çıktısı yoktu, yalnızca yuvarlanmış iddialar:
+
+| Yaklaşım | Plan | Süre |
+|---|---|---|
+| Doğrudan `work_orders` taraması | Parallel Seq Scan (3 worker) | **106 ms** |
+| Materyalize view + sıralama indeksi | Index Scan → 10 satır | **0,06 ms** |
+| `REFRESH ... CONCURRENTLY` | 1M satır agregasyonu | **96 ms** |
+
+Metin ayrıca **"~1.800× hız farkı"** ve **"1.006.000 satırda birebir aynı"**
+diyordu.
+
+**Neden yanlıştı — üç bağımsız sebep:**
+
+1. **Ham plan yoktu.** Dosyada tek bir `Execution Time` veya `Buffers:` satırı
+   bulunmuyordu (ölçtüm: eski sürümde 0, yeni sürümde 8 `Execution Time` +
+   29 `Buffers`). Yani sayılar hiçbir komutla yeniden üretilemiyordu; "kanıt"
+   diye sunulan şey aslında bir tahmindi.
+2. **Aritmetik tutmuyordu.** 106 / 0,06 = **1.766**, metin 1.800 diyordu.
+   Gerçek oran da tutmuyordu.
+3. **Satır sayısı uydurmaydı.** "1.006.000" yuvarlak bir sayı; gerçek ölçüm
+   **1.008.523**. Doğruluk iddiasının dayanağı (`EXCEPT` ile 0 fark) da
+   komutuyla birlikte verilmemişti.
+
+En tehlikelisi 1. maddedir: sayı doğru olsa bile **doğrulanamaz** bir iddia
+sınavda tek soruda çöker ("planı göster").
+
+**Sonra (düzeltilmiş):** Aynı ölçümler gerçekten koşturuldu, ham çıktılar
+README §7'ye yapıştırıldı:
+
+```
+ Limit  (cost=0.29..400.41 rows=50 width=23) (actual time=1.595..1.608 rows=50 loops=1)
+   Buffers: shared hit=258 dirtied=1
+   ->  Index Scan Backward using work_orders_pkey on work_orders
+         (actual time=0.018..1.425 rows=8050 loops=1)
+ Execution Time: 0.896 ms
+```
+
+Gerçek değerler: 1.008.523 satır, canlı tarama **93,2 ms**, MV **0,100 ms**
+(≈**932×**, 1.800× değil), refresh **86,4 ms**, `EXCEPT` iki yönde **0 / 0**.
+
+**Çıkarılan kural:** Rapora yalnızca *yeniden koşturulabilir* sayı girer; her
+performans iddiasının yanında onu üreten komut ve ham plan bulunur.
+
+**İkinci örnek (kendi yazdığım kodda bulunan hata):** oturum yenileme akışında
+`if (... && !path.startsWith('/auth/'))` koşulu, `/auth/me` çağrısını da
+kapsıyordu. Sonuç: access token süresi dolduğunda yenileme **hiç denenmiyor**,
+kullanıcı doğrudan dışarı atılıyordu. Ağ kaydı kanıtı:
+
+```
+GET  /api/v1/auth/me     → 401
+POST /api/v1/auth/logout → 204      (yenileme denendi mi? hayır)
+```
+
+Düzeltme sonrası aynı senaryo: `GET /auth/me → 401` → `POST /auth/refresh → 200`
+→ oturum kesintisiz devam. Hata, "401 gelince ne oluyor?" diye ağ trafiğine
+bakılmadan bulunamazdı; bu yüzden testi tarayıcıda gerçek istekle yaptım.
+
+---
+
+### 5. "Önleyici bakım takvimi" görevinin doğru çalıştığını nasıl kanıtladın?
+
+Üç katmanlı kanıt: **uçtan uca araç**, **otomatik test**, **veritabanı değişmezi**.
+
+**(a) Uçtan uca doğrulama aracı**
+
+```bash
+make verify
+```
+
+```
+T-1 | PASS | 77ms | Sayaç WO #6002 üretildi, birikmeme ve sonraki tarih (2026-11-25T19:20:18Z) doğrulandı
+```
+
+Bu satır üç şeyi birlikte kanıtlar: sayaç eşiği aşılınca iş emri üretildi,
+ikinci tetikleme **birikmedi**, tamamlanınca sonraki bakım tarihi hesaplandı.
+
+**(b) Otomatik test (tek başına koşturulabilir)**
+
+```bash
+docker compose --profile test run --rm test \
+  sh -c "go test -race -run TestIntegration10 -v ./internal/handlers/"
+```
+
+```
+=== RUN   TestIntegration10_PreventiveMaintenanceMeterAndNoBacklog_Task1
+--- PASS: TestIntegration10_PreventiveMaintenanceMeterAndNoBacklog_Task1 (0.64s)
+PASS
+ok  	bakimplan/internal/handlers	1.652s
+```
+
+Testin içindeki üç iddia:
+
+| Adım | Beklenen | Neden önemli |
+|---|---|---|
+| Sayaç 520 (eşik 500) | **1** iş emri üretilir | Eşik aşımı yakalanıyor |
+| Sayaç 1200 (aynı plan, açık iş emri var) | **0** yeni iş emri | "Birikmeme" kuralı |
+| Sayaç 800 (1200'den geriye) | **400 METER_ROLLBACK** | Sayaç monotonluğu; veri bozulmasını engeller |
+
+**(c) Veritabanı değişmezi** — "aynı plan için en fazla bir açık iş emri"
+
+```bash
+docker compose exec db psql -U cmms_user -d bakimplan_db -c \
+"SELECT preventive_plan_id, count(*) FROM work_orders
+  WHERE preventive_plan_id IS NOT NULL
+    AND status IN ('acik','atandi','devam_ediyor')
+  GROUP BY 1 HAVING count(*) > 1;"
+```
+
+```
+ preventive_plan_id | aktif_wo
+--------------------+----------
+(0 rows)
+```
+
+Kural iki yerde birden korunuyor: uygulama `ON CONFLICT DO NOTHING` ile dener,
+veritabanı da kısmi tekil indeksle (`uq_active_pm_work_order`) reddeder. Yani
+kod hatası olsa bile **veri** bozulmaz — asıl güvence budur.
 
 ---
 

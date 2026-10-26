@@ -67,8 +67,16 @@ docker compose --profile test run --rm test
 ```
 
 > Testler `test` servisinde, imajın Go araç zincirini içeren `builder`
-> katmanında çalışır ve `db:5432` üzerinden bağlanır. `-race` bayrağı cgo
-> gerektirdiği için servis içinde `gcc` kurulur.
+> katmanında çalışır ve **`db_test:5432`** (veritabanı `bakimplan_test`)
+> üzerinden bağlanır. `-race` bayrağı cgo gerektirdiği için servis içinde
+> `gcc` kurulur.
+>
+> **Neden ayrı veritabanı?** Testler oluşturdukları ekipman/iş emri/stok
+> kayıtlarını silmez. Bunlar demo veritabanına yazıldığında her koşu ağaca
+> sahte düğümler ekliyordu (`EQ-IDEM-…`, `EQ-MV-…`, `TES-T2-…`) ve arayüzdeki
+> ekipman hiyerarşisi 2.000 yerine 2.146 görünüyordu. `db_test` **`tmpfs`**
+> kullanır: veri bellekte durur, konteyner kalkınca sıfırlanır. Testler artık
+> demo verisine **hiç** dokunamaz.
 
 **53 test**, beş kategori:
 
@@ -270,9 +278,19 @@ Tarayıcıda <http://localhost:3000> açılır. Her senaryo 2-3 dakika sürer.
 | 13 | **Yönetici** ile giriş → **Denetim Kaydı** | Her satır **tek** (mükerrer yok); JSONB alanlar Türkçe etiketli, tarih/kuruş biçimli |
 | 14 | Pencereyi daralt (mobil genişlik) | Menü hamburger'a düşer, tablolar yatay kaydırılır |
 | 15 | Sayfa yenile (F5) | Oturum korunur (token doğrulanır) |
+| 16 | Üst bardaki rozet | **"Canlı Sistem"** veya **"Canlı · N sn"**; üzerine gelince tooltip: `son sinyal: N sn önce · mod: deterministic · tick: N` |
+| 17 | **Ekipman Ağacı**'nı ilk açılışta izle | Önce **"Ekipman ağacı yükleniyor…"**; ~1 sn sonra **"Toplam 2000 ekipman"** ve 5 tesis sekmesi (TES-01…05). **"Toplam 0 ekipman" yanıp sönmemeli** |
+| 18 | 10 saniye bekle, rozete tekrar bak | `tick` değeri artmış olmalı (simülatör gerçekten ayakta) |
 
 **Kontrol noktaları:** Her ekranda yükleniyor iskeleti, boş durum metni ve
 hata + "tekrar dene" butonu bulunmalı. Konsolda hata olmamalı.
+
+> **Not (ekipman sayısı):** Temiz kurulumda ağaçta **2.000** ekipman olur.
+> `make verify` çalıştırıldıysa birkaç test ekipmanı eklenir (2.001–2.005 gibi);
+> bu normaldir ve **`make reset-demo`** ile 2.000'e döner. `EQ-IDEM-…`,
+> `EQ-MV-…`, `TES-T2-…` gibi 19 haneli kodlar görürseniz bu eski bir sürümün
+> test artığıdır — `make reset-demo` ile temizlenir. (Yeni sürümde testler ayrı
+> `db_test` veritabanında koştuğu için bu artıklar oluşmaz.)
 
 ---
 
@@ -298,6 +316,8 @@ dosyaları). Test edilmeyen şey bozulur; pipeline'ın kapsamı ürünün kapsam
 |---|---|
 | `make verify` idempotent değil | Aynı DB'de tekrar koşarsan T-2/T-3 düşer → `make reset-demo` |
 | `verify` veriyi değiştirir | Demo DB'sinde çalıştırın; üretimde kullanmayın |
+| Test artıkları | **Çözüldü:** testler ayrı `db_test` veritabanında koşar; demo verisi etkilenmez |
+| `db_test` diski | `tmpfs` — konteyner kalkınca veri gider; kalıcı bir şey kaybedilmez |
 | 1M satır performansı | Ölçüldü: 93,2 ms → 0,100 ms (README §7.3) |
 | Materyalize view tazeliği | Refresh açık çağrıyla; `age_seconds` ile izlenebilir (README §7.6) |
 | Mobil erişim | `VITE_API_URL` yeniden derleme gerektirir (README §9) |
