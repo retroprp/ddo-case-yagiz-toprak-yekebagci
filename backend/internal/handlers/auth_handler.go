@@ -32,11 +32,11 @@ func SeedDefaultUsers(ctx context.Context, pool *pgxpool.Pool) error {
 		FullName string
 		Role     string
 	}{
-		{"teknisyen@bakimplan.local", "Ahmet Yılmaz (Teknisyen)", "teknisyen"},
-		{"planlama@bakimplan.local", "Zeynep Kaya (Bakım Planlama)", "planlama"},
+		{"teknisyen@bakimplan.local", "Enis Çeker (Teknisyen)", "teknisyen"},
+		{"planlama@bakimplan.local", "İnan Mahmud (Bakım Planlama)", "planlama"},
 		{"uretim@bakimplan.local", "Mehmet Demir (Üretim Sorumlusu)", "uretim"},
-		{"depo@bakimplan.local", "Elif Çelik (Depo Sorumlusu)", "depo"},
-		{"yonetici@bakimplan.local", "Canan Öztürk (Yönetici)", "yonetici"},
+		{"depo@bakimplan.local", "Erdinç Arslan (Depo Sorumlusu)", "depo"},
+		{"yonetici@bakimplan.local", "Yağız Toprak (Yönetici)", "yonetici"},
 	}
 
 	for _, u := range demoUsers {
