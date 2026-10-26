@@ -53,6 +53,32 @@ const canCompleteWorkOrder = computed(() => hasRole('teknisyen', 'planlama', 'yo
 const canCreateFailure = computed(() => hasRole('uretim', 'teknisyen', 'planlama', 'yonetici'))
 const canCreatePM = computed(() => hasRole('planlama', 'yonetici'))
 
+// ── F-3: Durum geçişi yetkileri ────────────────────────────────────────────
+// Sunucu tarafı da aynı rolleri kontrol eder (403). Buradaki kontrol yalnızca
+// butonu göstermek/gizlemek için; yetkilendirme backend'de.
+const canTransitionWorkOrder = computed(() => hasRole('teknisyen', 'planlama', 'yonetici'))
+// F-6: Atama yalnızca planlama ve yöneticiye açık.
+const canAssignWorkOrder = computed(() => hasRole('planlama', 'yonetici'))
+
+// Teknisyen listesi: atama modalındaki seçim kutusu için.
+// /technicians/workload zaten teknisyenleri döndürüyor, ayrı uç eklemedik.
+const technicians = ref([])
+
+// ── Atama modalı ───────────────────────────────────────────────────────────
+const assignTarget = ref(null)     // iş emri satırı
+const assignTechID = ref('')
+const assignNote = ref('')
+const assignRunning = ref(false)
+
+// ── Durum geçmişi paneli ───────────────────────────────────────────────────
+const eventsTarget = ref(null)     // iş emri satırı
+const events = ref([])
+const eventsLoading = ref(false)
+const eventsError = ref('')
+
+// Aynı iş emrinin iki kez açılmasını engellemek için işlem sürerken satırı kilitle.
+const rowBusy = ref(null)
+
 // --- Formlar ---
 const workOrderForm = ref({
   equipment_id: '',
@@ -155,6 +181,10 @@ async function loadList(append = false) {
 
 async function refresh() {
   await loadEquipments()
+  // Atama modalı için teknisyen listesi (yalnızca iş emri ekranında gerekli).
+  if (props.section === 'workorders' && canAssignWorkOrder.value) {
+    await loadTechnicians()
+  }
   nextCursor.value = null
   await loadList(false)
 }
@@ -197,6 +227,156 @@ async function completeWorkOrder(row) {
   } catch (err) {
     actionError.value = err.message
   }
+}
+
+// ── F-6: Teknisyen atama ───────────────────────────────────────────────────
+// /technicians/workload yanıtı { technician_id, full_name, ... } döner.
+async function loadTechnicians() {
+  try {
+    const res = await apiFetch('/technicians/workload')
+    technicians.value = res.items || []
+  } catch (_) {
+    technicians.value = []
+  }
+}
+
+function openAssign(row) {
+  resetMessages()
+  assignTarget.value = row
+  // Mevcut atama varsa onu önseçili getir (yeniden atama senaryosu).
+  assignTechID.value = row.assigned_to ? String(row.assigned_to) : ''
+  assignNote.value = ''
+}
+
+function closeAssign() {
+  assignTarget.value = null
+  assignTechID.value = ''
+  assignNote.value = ''
+}
+
+async function submitAssign() {
+  if (!assignTarget.value || !assignTechID.value) return
+  resetMessages()
+  assignRunning.value = true
+  try {
+    const res = await apiFetch(`/work-orders/${assignTarget.value.id}/assign`, {
+      method: 'POST',
+      body: JSON.stringify({
+        technician_id: Number(assignTechID.value),
+        note: assignNote.value || undefined
+      })
+    })
+    actionSuccess.value = `İş emri #${res.work_order_id} → teknisyen #${res.assigned_to} atandı (durum: ${res.status}).`
+    closeAssign()
+    await loadList(false)
+  } catch (err) {
+    actionError.value = err.message
+  } finally {
+    assignRunning.value = false
+  }
+}
+
+async function unassignWorkOrder(row) {
+  resetMessages()
+  rowBusy.value = row.id
+  try {
+    const res = await apiFetch(`/work-orders/${row.id}/assign`, { method: 'DELETE' })
+    actionSuccess.value = `İş emri #${res.work_order_id} ataması kaldırıldı (durum: ${res.status}).`
+    await loadList(false)
+  } catch (err) {
+    actionError.value = err.message
+  } finally {
+    rowBusy.value = null
+  }
+}
+
+// ── F-3: Durum geçişi ──────────────────────────────────────────────────────
+// Geçiş matrisi sunucuda; burada yalnızca geçerli hedefler için buton gösterilir.
+const nextStatuses = {
+  acik: ['atandi', 'iptal'],
+  atandi: ['devam_ediyor', 'acik', 'iptal'],
+  devam_ediyor: ['tamamlandi', 'iptal'],
+  tamamlandi: [],
+  iptal: []
+}
+
+// Satırdaki duruma göre gösterilecek butonlar.
+// 'tamamlandi' burada YOK: yan etkileri (stok tüketimi + PM yeniden planlama)
+// nedeniyle ayrı uçtan (/complete) yapılır.
+// 'atandi' hedefi teknik seçimi gerektirdiği için yalnızca atama yetkisi
+// olanlara gösterilir; aksi hâlde teknisyen "Ata"ya basıp 403 alırdı.
+function actionsFor(row) {
+  const allowed = nextStatuses[row.status] || []
+  return allowed.filter((s) => {
+    if (s === 'tamamlandi') return false
+    if (s === 'atandi' && !canAssignWorkOrder.value) return false
+    return true
+  })
+}
+
+const statusActionLabel = {
+  atandi: 'Ata',
+  devam_ediyor: 'Başlat',
+  acik: 'Havuza Dön',
+  iptal: 'İptal'
+}
+
+const statusActionClass = {
+  atandi: 'bg-blue-600 hover:bg-blue-700 text-white',
+  devam_ediyor: 'bg-amber-600 hover:bg-amber-700 text-white',
+  acik: 'bg-slate-200 hover:bg-slate-300 text-slate-700',
+  iptal: 'bg-rose-100 hover:bg-rose-200 text-rose-700'
+}
+
+async function changeStatus(row, target) {
+  resetMessages()
+  if (target === 'iptal' && !window.confirm(`İş emri ${row.code} iptal edilsin mi? Bu işlem geri alınamaz.`)) {
+    return
+  }
+  rowBusy.value = row.id
+  try {
+    const res = await apiFetch(`/work-orders/${row.id}/status`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status: target })
+    })
+    actionSuccess.value = `#${res.work_order_id}: ${res.from_status} → ${res.to_status}` +
+      (res.allowed_next?.length ? ` (sonraki: ${res.allowed_next.join(', ')})` : '')
+    await loadList(false)
+  } catch (err) {
+    actionError.value = err.message
+  } finally {
+    rowBusy.value = null
+  }
+}
+
+// 'Ata' butonu hem durum geçişi (acik→atandi) hem de teknisyen seçimi gerektirir,
+// bu yüzden modal açar. Diğer geçişler tek tıkla yapılır.
+function onStatusAction(row, target) {
+  if (target === 'atandi') return openAssign(row)
+  return changeStatus(row, target)
+}
+
+// ── F-3: Durum geçmişi ─────────────────────────────────────────────────────
+async function openEvents(row) {
+  resetMessages()
+  eventsTarget.value = row
+  events.value = []
+  eventsError.value = ''
+  eventsLoading.value = true
+  try {
+    const res = await apiFetch(`/work-orders/${row.id}/events`)
+    events.value = res.items || []
+  } catch (err) {
+    eventsError.value = err.message
+  } finally {
+    eventsLoading.value = false
+  }
+}
+
+function closeEvents() {
+  eventsTarget.value = null
+  events.value = []
+  eventsError.value = ''
 }
 
 async function submitFailure() {
@@ -357,15 +537,50 @@ onMounted(refresh)
                   <td class="py-2 pr-2 text-right font-mono text-slate-700">
                     {{ formatTL((row.labor_cost_kurus || 0) + (row.parts_cost_kurus || 0)) }}
                   </td>
-                  <td class="py-2 text-right">
-                    <button
-                      v-if="canCompleteWorkOrder && row.status !== 'tamamlandi' && row.status !== 'iptal'"
-                      @click="completeWorkOrder(row)"
-                      class="text-[10px] px-2 py-1 rounded bg-emerald-600 text-white font-semibold hover:bg-emerald-700"
-                    >
-                      Tamamla
-                    </button>
-                    <span v-else class="text-[10px] text-slate-300">—</span>
+                  <td class="py-2">
+                    <div class="flex flex-wrap items-center justify-end gap-1">
+                      <!--
+                        Aksiyonlar duruma göre üretilir (actionsFor).
+                        'tamamlandi' listede yok: yan etkileri nedeniyle /complete ucu kullanılır.
+                      -->
+                      <button
+                        v-for="target in canTransitionWorkOrder ? actionsFor(row) : []"
+                        :key="target"
+                        :disabled="rowBusy === row.id"
+                        @click="onStatusAction(row, target)"
+                        :class="['text-[10px] px-2 py-1 rounded font-semibold disabled:opacity-50', statusActionClass[target]]"
+                      >
+                        {{ statusActionLabel[target] || target }}
+                      </button>
+
+                      <button
+                        v-if="canCompleteWorkOrder && row.status !== 'tamamlandi' && row.status !== 'iptal'"
+                        :disabled="rowBusy === row.id"
+                        @click="completeWorkOrder(row)"
+                        class="text-[10px] px-2 py-1 rounded bg-emerald-600 text-white font-semibold hover:bg-emerald-700 disabled:opacity-50"
+                      >
+                        Tamamla
+                      </button>
+
+                      <button
+                        v-if="canAssignWorkOrder && row.assigned_to && (row.status === 'acik' || row.status === 'atandi')"
+                        :disabled="rowBusy === row.id"
+                        @click="unassignWorkOrder(row)"
+                        class="text-[10px] px-2 py-1 rounded bg-slate-100 text-slate-600 font-semibold hover:bg-slate-200 disabled:opacity-50"
+                      >
+                        Atamayı Kaldır
+                      </button>
+
+                      <button
+                        @click="openEvents(row)"
+                        class="text-[10px] px-2 py-1 rounded text-indigo-600 font-semibold hover:bg-indigo-50"
+                      >
+                        Geçmiş
+                      </button>
+                    </div>
+                    <div v-if="row.assigned_to" class="text-[10px] text-slate-400 text-right mt-0.5">
+                      teknisyen #{{ row.assigned_to }}
+                    </div>
                   </td>
                 </tr>
               </tbody>
@@ -560,6 +775,142 @@ onMounted(refresh)
           Rolünüz ({{ store.user?.role }}) bu ekranda kayıt oluşturamaz; yalnızca görüntüleme yapabilir.
         </div>
       </aside>
+    </div>
+
+    <!-- ── F-6: Teknisyen atama modalı ─────────────────────────────────── -->
+    <!--
+      Modal (dialog) seçildi çünkü atama, satır içinde tek tıkla yapılamayacak
+      kadar çok girdi istiyor (teknisyen + not). Ayrı sayfa açmak ise
+      bağlamı kaybettirirdi: kullanıcı hangi iş emrini atadığını unutur.
+    -->
+    <div
+      v-if="assignTarget"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+      @click.self="closeAssign"
+    >
+      <div class="bg-white rounded-xl shadow-xl border border-slate-200 w-full max-w-md p-5">
+        <div class="flex items-start justify-between gap-3 mb-3">
+          <div>
+            <h2 class="text-sm font-bold text-slate-800">Teknisyen Ata</h2>
+            <p class="text-[11px] text-slate-500 mt-0.5 font-mono">{{ assignTarget.code }}</p>
+          </div>
+          <button @click="closeAssign" class="text-slate-400 hover:text-slate-700 font-bold">✕</button>
+        </div>
+
+        <form @submit.prevent="submitAssign" class="space-y-3">
+          <label class="block">
+            <span class="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Teknisyen</span>
+            <select
+              v-model="assignTechID"
+              required
+              class="mt-1 w-full text-xs border border-slate-300 rounded-lg px-2.5 py-2 bg-white"
+            >
+              <option value="" disabled>Seçin</option>
+              <option v-for="tech in technicians" :key="tech.technician_id" :value="tech.technician_id">
+                {{ tech.full_name }} — aktif {{ tech.active_tasks }}
+              </option>
+            </select>
+          </label>
+
+          <label class="block">
+            <span class="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Not (isteğe bağlı)</span>
+            <input
+              v-model="assignNote"
+              type="text"
+              placeholder="örn. vardiya teknisyeni"
+              class="mt-1 w-full text-xs border border-slate-300 rounded-lg px-2.5 py-2"
+            />
+          </label>
+
+          <p class="text-[10px] text-slate-400">
+            Atama, iş emrini <span class="font-mono">acik</span> durumundan
+            <span class="font-mono">atandi</span> durumuna geçirir ve geçmişe kayıt düşer.
+            Yalnızca <span class="font-mono">teknisyen</span> rolündeki kullanıcılar atanabilir.
+          </p>
+
+          <div class="flex gap-2 pt-1">
+            <button
+              type="button"
+              @click="closeAssign"
+              class="flex-1 text-xs px-3 py-2 rounded-lg border border-slate-300 font-semibold text-slate-700 hover:bg-slate-50"
+            >
+              Vazgeç
+            </button>
+            <button
+              type="submit"
+              :disabled="assignRunning || !assignTechID"
+              class="flex-1 text-xs px-3 py-2 rounded-lg bg-blue-600 text-white font-semibold hover:bg-blue-700 disabled:opacity-50"
+            >
+              {{ assignRunning ? 'Atanıyor...' : 'Ata' }}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- ── F-3: Durum geçmişi modalı ───────────────────────────────────── -->
+    <div
+      v-if="eventsTarget"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+      @click.self="closeEvents"
+    >
+      <div class="bg-white rounded-xl shadow-xl border border-slate-200 w-full max-w-lg p-5">
+        <div class="flex items-start justify-between gap-3 mb-3">
+          <div>
+            <h2 class="text-sm font-bold text-slate-800">Durum Geçmişi</h2>
+            <p class="text-[11px] text-slate-500 mt-0.5 font-mono">
+              {{ eventsTarget.code }} · {{ eventsTarget.title }}
+            </p>
+          </div>
+          <button @click="closeEvents" class="text-slate-400 hover:text-slate-700 font-bold">✕</button>
+        </div>
+
+        <div v-if="eventsLoading" class="flex items-center gap-2 py-6 text-xs text-slate-500">
+          <span class="animate-spin inline-block w-4 h-4 border-2 border-emerald-600 border-t-transparent rounded-full"></span>
+          Geçmiş yükleniyor...
+        </div>
+
+        <div v-else-if="eventsError" class="p-3 text-xs text-red-800 bg-red-50 border border-red-200 rounded-lg">
+          {{ eventsError }}
+        </div>
+
+        <div v-else-if="events.length === 0" class="py-8 text-center text-xs text-slate-400 border border-dashed border-slate-200 rounded-lg">
+          Bu iş emri için henüz geçmiş kaydı yok.
+        </div>
+
+        <ol v-else class="space-y-2 max-h-80 overflow-y-auto pr-1">
+          <li
+            v-for="ev in events"
+            :key="ev.id"
+            class="border border-slate-200 rounded-lg p-2.5"
+          >
+            <div class="flex flex-wrap items-center gap-1.5">
+              <span v-if="ev.from_status" class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
+                {{ ev.from_status }}
+              </span>
+              <span v-if="ev.from_status" class="text-[10px] text-slate-400">→</span>
+              <span :class="['text-[10px] font-mono px-1.5 py-0.5 rounded border font-semibold', statusBadge[ev.to_status] || 'bg-slate-100 text-slate-600 border-slate-200']">
+                {{ ev.to_status }}
+              </span>
+              <span class="ml-auto text-[10px] text-slate-400">{{ formatDate(ev.created_at) }}</span>
+            </div>
+            <div class="text-[11px] text-slate-600 mt-1">
+              {{ ev.actor_name || 'sistem' }}
+              <span v-if="ev.actor_role" class="text-slate-400">({{ ev.actor_role }})</span>
+            </div>
+            <div v-if="ev.note" class="text-[10px] text-slate-400 italic mt-0.5">{{ ev.note }}</div>
+          </li>
+        </ol>
+
+        <div class="mt-4 text-right">
+          <button
+            @click="closeEvents"
+            class="text-xs px-3 py-2 rounded-lg bg-slate-900 text-white font-semibold hover:bg-slate-800"
+          >
+            Kapat
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
