@@ -4,15 +4,26 @@ import { store, apiFetch, formatTL } from '../store'
 
 const equipmentTree = ref([])
 const flatEquipmentsCount = ref(0)
+// Yükleme durumu: ağaç gelene kadar "0 ekipman / kayıt yok" yazmak yanıltıcıydı
+// (ilk açılışta 0,6-2 sn boyunca boş görünüyordu). Artık bu sürede iskelet gösterilir.
+const treeLoading = ref(true)
+const treeError = ref('')
 const selectedRootIndex = ref(0)
 const moveForm = ref({ equipmentId: 6, newParentId: 31 })
 
 async function loadTree() {
+  treeLoading.value = true
+  treeError.value = ''
   try {
     const res = await apiFetch('/equipments/tree')
     equipmentTree.value = res.tree || []
-    flatEquipmentsCount.value = res.flat_count || 2000
-  } catch (_) {}
+    flatEquipmentsCount.value = res.flat_count || 0
+  } catch (err) {
+    // Sessizce yutmak yerine nedeni göster: kullanıcı "bozuk mu?" diye tahmin etmesin.
+    treeError.value = err?.message || 'Ekipman ağacı yüklenemedi.'
+  } finally {
+    treeLoading.value = false
+  }
 }
 
 async function testMoveEquipment() {
@@ -35,7 +46,11 @@ onMounted(loadTree)
       <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
         <div>
           <h2 class="text-base font-bold text-slate-800">Ekipman Hiyerarşisi (Tesis → Hat → Makine → Bileşen)</h2>
-          <p class="text-xs text-slate-500">Toplam {{ flatEquipmentsCount }} ekipman `WITH RECURSIVE` ile sorgulandı; maliyet ve duruşlar yukarı toplandı (Roll-up).</p>
+          <p class="text-xs text-slate-500">
+            <template v-if="treeLoading">Ekipman ağacı yükleniyor…</template>
+            <template v-else-if="treeError">{{ treeError }}</template>
+            <template v-else>Toplam {{ flatEquipmentsCount }} ekipman `WITH RECURSIVE` ile sorgulandı; maliyet ve duruşlar yukarı toplandı (Roll-up).</template>
+          </p>
         </div>
         <div class="flex gap-1">
           <button
@@ -49,7 +64,13 @@ onMounted(loadTree)
         </div>
       </div>
 
-      <div v-if="equipmentTree.length === 0" class="p-8 text-center text-slate-400 text-xs">Kayıtlı ekipman bulunamadı.</div>
+      <div v-if="treeLoading" class="p-8 text-center text-slate-400 text-xs">
+        <span class="inline-block w-3 h-3 rounded-full bg-slate-300 animate-pulse mr-2"></span>Ekipman ağacı yükleniyor…
+      </div>
+
+      <div v-else-if="treeError" class="p-8 text-center text-red-500 text-xs">{{ treeError }}</div>
+
+      <div v-else-if="equipmentTree.length === 0" class="p-8 text-center text-slate-400 text-xs">Kayıtlı ekipman bulunamadı.</div>
 
       <div v-else-if="equipmentTree[selectedRootIndex]" class="space-y-3">
         <div class="p-3 rounded-lg bg-slate-900 text-white flex flex-wrap justify-between items-center gap-2">

@@ -33,13 +33,31 @@ export function clearBanners() {
 
 export async function apiFetch(path, options = {}) {
   // silent: true → hata banner'ını gösterme (örn. beklenen 403 testleri).
-  const { silent = false, ...fetchOptions } = options
-  clearBanners()
-  store.loading = true
+  //
+  // background: true → "sessiz yenileme" istekleri için (rozet yoklaması gibi).
+  //   Bu modda:
+  //     - global yükleme çubuğu AÇILMAZ (store.loading'e dokunulmaz),
+  //     - mevcut hata/başarı mesajları SİLİNMEZ (clearBanners çağrılmaz).
+  //
+  //   Neden gerekli: simülatör rozeti 5 sn'de bir yoklama yapıyordu. Eski hâlde
+  //   her yoklama store.loading=true yapıp tam genişlikte "Veriler yükleniyor"
+  //   çubuğunu basıyordu; çubuk router-view'in üstüne girdiği için sayfa
+  //   66 px aşağı zıplayıp geri geliyordu (ölçüldü: 84 px → 150 px → 84 px).
+  //   Ayrıca her yoklama kullanıcının okuduğu mesajı siliyordu.
+  const { silent = false, background = false, ...fetchOptions } = options
+  if (!background) {
+    clearBanners()
+    store.loading = true
+  }
   try {
-    const headers = {
-      'Content-Type': 'application/json',
-      ...(fetchOptions.headers || {})
+    const headers = { ...(fetchOptions.headers || {}) }
+
+    // Content-Type yalnızca gövde varsa gönderilir.
+    // Not: asıl preflight sebebi Authorization başlığıdır (CORS'ta basit başlık
+    // değildir); bunu backend'deki `MaxAge` ile önbelleğe alıyoruz. Yine de
+    // gövdesiz bir GET'e Content-Type eklemek gereksiz ve yanıltıcıdır.
+    if (fetchOptions.body != null && !headers['Content-Type']) {
+      headers['Content-Type'] = 'application/json'
     }
     if (store.token) {
       headers['Authorization'] = `Bearer ${store.token}`
@@ -60,10 +78,10 @@ export async function apiFetch(path, options = {}) {
     }
     return data
   } catch (err) {
-    if (!silent) store.errorBanner = err.message
+    if (!silent && !background) store.errorBanner = err.message
     throw err
   } finally {
-    store.loading = false
+    if (!background) store.loading = false
   }
 }
 

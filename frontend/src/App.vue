@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import {
   store,
@@ -23,6 +23,72 @@ const loginError = ref('')
 const rbacTestRunning = ref(false)
 const rbacTest = ref(null)
 
+// ── Simülatör canlılık rozeti ───────────────────────────────────────────────
+// Seed deterministik olduğu için veri sürekli değişmiyor; simülatör 5 sn'de bir
+// heartbeat yazıyor. Bu rozet o sinyali okur: "Canlı · 3 sn" gibi. Sinyal
+// 30 sn'den eskiyse "Simülatör bekliyor" olur (yanlış "canlı" izlenimi vermez).
+const simStatus = ref(null)
+const simError = ref(false)
+let simTimer = null
+
+const simLabel = computed(() => {
+  if (!store.user) return 'Canlı Sistem'
+  if (simError.value) return 'Simülatör durumu alınamadı'
+  if (!simStatus.value) return 'Bağlanıyor…'
+  if (!simStatus.value.running) return 'Simülatör bekliyor'
+  const age = Number(simStatus.value.age_seconds ?? 0)
+  return age <= 2 ? 'Canlı Sistem' : `Canlı · ${age} sn`
+})
+
+const simBadgeClass = computed(() => {
+  if (!store.user) return 'bg-emerald-950 text-emerald-300 border-emerald-700'
+  if (simError.value) return 'bg-amber-950 text-amber-300 border-amber-700'
+  if (!simStatus.value || !simStatus.value.running) return 'bg-slate-800 text-slate-400 border-slate-700'
+  return 'bg-emerald-950 text-emerald-300 border-emerald-700'
+})
+
+const simDotClass = computed(() => {
+  if (!store.user || simError.value) return 'bg-amber-400'
+  if (!simStatus.value || !simStatus.value.running) return 'bg-slate-500'
+  // animate-pulse KALDIRILDI: 2 saniyelik opaklık döngüsü (1 → 0.5 → 1)
+  // göz kenarda sürekli kırpışma olarak algılanıyordu. Sabit yeşil nokta
+  // "ayakta" bilgisini zaten veriyor; canlılık tick sayısıyla doğrulanabilir.
+  return 'bg-emerald-400'
+})
+
+async function loadSimulatorStatus() {
+  if (!store.token) return
+  try {
+    // background: true → global yükleme çubuğunu açmaz, mesajları silmez.
+    // (Aksi hâlde 5 sn'de bir sayfa 66 px zıplıyordu.)
+    const res = await apiFetch('/simulator/status', { silent: true, background: true })
+    simStatus.value = res
+    simError.value = false
+  } catch (_) {
+    simError.value = true
+  }
+}
+
+// Yoklama aralığı: 10 sn.
+//
+// Neden 5 değil: rozet "son sinyal kaç saniye önce" bilgisini gösteriyor;
+// simülatör 5 sn'de bir yazdığı için 10 sn'lik yoklama yeterince canlı
+// (gösterilen değer 0-10 sn arasında kalır) ve ağ trafiğini yarıya indirir.
+const SIM_POLL_MS = 10000
+
+function startSimulatorPolling() {
+  stopSimulatorPolling()
+  loadSimulatorStatus()
+  simTimer = setInterval(loadSimulatorStatus, SIM_POLL_MS)
+}
+
+function stopSimulatorPolling() {
+  if (simTimer) {
+    clearInterval(simTimer)
+    simTimer = null
+  }
+}
+
 const visibleRoutes = computed(() => {
   if (!store.user) return []
   return navRoutes.filter((r) => r.roles.includes(store.user.role))
@@ -42,6 +108,7 @@ async function onLogin() {
   rbacTest.value = null
   try {
     const user = await loginWithCredentials(loginEmail.value.trim(), loginPassword.value)
+    startSimulatorPolling()
     const first = firstRouteFor(user)
     if (routeAllows(user, route.name)) {
       await router.replace({ path: route.path, query: { _t: Date.now() } })
@@ -54,6 +121,9 @@ async function onLogin() {
 }
 
 async function onLogout() {
+  stopSimulatorPolling()
+  simStatus.value = null
+  simError.value = false
   logoutUser()
   rbacTest.value = null
   loginError.value = ''
@@ -116,11 +186,15 @@ onMounted(async () => {
     if (route.name !== 'login') await router.replace({ name: 'login' })
     return
   }
+  startSimulatorPolling()
   const first = firstRouteFor(store.user)
   if (first && !routeAllows(store.user, route.name)) {
     await router.replace(first.path)
   }
 })
+
+// Sayfa kapanırken zamanlayıcıyı temizle (bellek sızıntısı olmasın).
+onUnmounted(stopSimulatorPolling)
 </script>
 
 <template>
@@ -137,8 +211,13 @@ onMounted(async () => {
           <div>
             <div class="flex items-center gap-2">
               <span class="font-extrabold text-lg tracking-tight text-emerald-400">BakımPlan</span>
-              <span class="text-xs bg-emerald-950 text-emerald-300 px-2 py-0.5 rounded border border-emerald-700 flex items-center gap-1">
-                <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span> Canlı Sistem
+              <!-- Canlılık rozeti: simülatör heartbeat'ini yansıtır (5 sn'de bir yenilenir).
+                   Statik "Canlı Sistem" yazısı yerine gerçek durum gösterilir. -->
+              <span
+                :class="['text-xs px-2 py-0.5 rounded border flex items-center gap-1 transition-colors', simBadgeClass]"
+                :title="simStatus ? `son sinyal: ${simStatus.age_seconds} sn önce · mod: ${simStatus.mode} · tick: ${simStatus.ticks}` : 'simülatör durumu okunuyor'"
+              >
+                <span :class="['w-2 h-2 rounded-full', simDotClass]"></span> {{ simLabel }}
               </span>
             </div>
             <p class="text-xs text-slate-400 hidden sm:block">Ekipman Bakım, Arıza, Stok ve Güvenilirlik Yönetim Sistemi</p>
