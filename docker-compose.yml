@@ -54,6 +54,14 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        # Tarayıcının erişeceği API adresi. Vite bu değeri DERLEME ANINDA
+        # JavaScript'in içine gömer (runtime env okunmaz). Bu yüzden:
+        #   - değer değişince `docker compose up -d --build frontend` gerekir
+        #   - telefondan erişim için bilgisayarın LAN IP'si verilir:
+        #     VITE_API_URL=http://192.168.1.42:8080/api/v1
+        # Varsayılan, aynı makineden çalışan kurulumla uyumludur.
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8080/api/v1}
     ports:
       - "3000:8080"
     depends_on:
@@ -92,8 +100,15 @@ services:
   # Otomatik testler (go test -race).
   #
   # Neden ayrı servis: DB host'a port açmadığı için host'tan `go test`
-  # localhost:5432'ye bağlanamaz. Testler compose ağında, "db:5432" ile koşar.
+  # localhost:5432'ye bağlanamaz. Testler compose ağında çalışır.
   # Bu, spec'in "veritabanı yalnızca compose ağında erişilsin" kuralıyla uyumlu.
+  #
+  # Neden AYRI veritabanı (db_test): testler kendi ekipman/iş emri/stok
+  # kayıtlarını oluşturur ve silmez. Daha önce demo veritabanına
+  # (bakimplan_db) yazıyorlardı; her `make test` koşusu ağaca 20+ sahte düğüm
+  # ekliyordu (EQ-IDEM-…, EQ-MV-…, TES-T2-…). Sonuç: ekipman hiyerarşisi
+  # 2.000 yerine 2.146 düğüm gösteriyordu. Artık testler kendi geçici
+  # veritabanında koşar; demo verisi hiç etkilenmez.
   #
   # target: builder — imajın Go araç zincirini içeren ara katmanı kullanılır
   # (çalışma imajı yalnızca derlenmiş binary'leri taşır, `go test` yapamaz).
@@ -110,11 +125,34 @@ services:
       - -c
       - apk add --no-cache gcc musl-dev >/dev/null && go test -race ./...
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgres://cmms_user:cmms_secret_pass@db:5432/bakimplan_db?sslmode=disable}
+      DATABASE_URL: postgres://${POSTGRES_USER:-cmms_user}:${POSTGRES_PASSWORD:-cmms_secret_pass}@db_test:5432/bakimplan_test?sslmode=disable
       JWT_SECRET: ${JWT_SECRET:-ddo-super-secret-jwt-key-2026-bakimplan}
     depends_on:
-      db:
+      db_test:
         condition: service_healthy
+
+  # Testlerin kullandığı izole PostgreSQL.
+  #
+  # tmpfs: veri bellekte tutulur. Konteyner her yeniden oluşturulduğunda
+  # veritabanı sıfırdan kurulur — test artıkları birikmez, disk şişmez.
+  # Yalnızca "test" profili etkinleştirildiğinde başlar; normal `docker compose up`
+  # bu servisi hiç oluşturmaz.
+  db_test:
+    image: postgres:16.4-alpine3.20
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cmms_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cmms_secret_pass}
+      POSTGRES_DB: bakimplan_test
+    expose:
+      - "5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cmms_user} -d bakimplan_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
 
 volumes:
   pgdata:

@@ -57,6 +57,13 @@ func main() {
 		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "Idempotency-Key"},
 		AllowCredentials: true,
+		// MaxAge: tarayıcı CORS preflight (OPTIONS) yanıtını 5 dakika önbelleğe alır.
+		//
+		// Neden gerekli: Authorization başlığı CORS'ta "basit başlık" sayılmaz,
+		// bu yüzden her istekten önce ayrı bir OPTIONS isteği gider. Arayüz
+		// simülatör durumunu periyodik yokladığı için bu, istek sayısını ikiye
+		// katlıyordu. Önbellekle aynı kaynak+uç için preflight 5 dakikada bir yapılır.
+		MaxAge: 300,
 	}))
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -82,6 +89,7 @@ func main() {
 	metricsHandler := handlers.NewMetricsHandler(pool)
 	lifecycleHandler := handlers.NewWorkOrderLifecycleHandler(pool)
 	metricsAdminHandler := handlers.NewMetricsAdminHandler(pool)
+	simulatorHandler := handlers.NewSimulatorHandler(pool)
 
 	extractUserID := func(r *http.Request) *int {
 		if claims, ok := auth.GetUserFromContext(r.Context()); ok && claims != nil {
@@ -102,6 +110,9 @@ func main() {
 			protected.Use(appmw.AuditTrail(pool, extractUserID))
 
 			protected.Get("/auth/me", authHandler.Me)
+
+			// Simülatör canlılık durumu (arayüzdeki "Canlı Sistem" rozeti için).
+			protected.Get("/simulator/status", simulatorHandler.Status)
 
 			// F-1 & T-2: Ekipman Hiyerarşisi
 			protected.Get("/equipments/tree", eqHandler.GetTree)

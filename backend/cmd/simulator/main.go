@@ -54,17 +54,55 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Eğer tek seferlik moddaysa çık; aksi halde konteynerin 'Exited' görünmemesi için deterministik veriyi bozmadan sinyal bekle
+	// Seed bitti. Veriyi bir daha DEĞİŞTİRMEYİZ (determinizm), ama servisin
+	// ayakta olduğunu arayüzde göstermek için 5 saniyede bir heartbeat yazarız.
+	// Bu yalnızca simulator_state tablosuna dokunur; seed verisi sabit kalır.
 	if os.Getenv("RUN_ONCE") == "true" {
 		slog.Info("simulator completed in RUN_ONCE mode")
 		return
 	}
 
-	slog.Info("deterministic seed verified and locked; simulator service standing by without mutating seeded state", "seed", seedVal)
+	slog.Info("deterministic seed verified and locked; entering heartbeat loop (seeded state is immutable)", "seed", seedVal)
+
+	if err := writeHeartbeat(ctx, pool, seedVal); err != nil {
+		slog.Warn("ilk heartbeat yazılamadı", "error", err)
+	}
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
-	slog.Info("simulator shutting down gracefully")
+
+	for {
+		select {
+		case <-ticker.C:
+			hbCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			if err := writeHeartbeat(hbCtx, pool, seedVal); err != nil {
+				slog.Warn("heartbeat yazılamadı", "error", err)
+			}
+			cancel()
+		case <-stop:
+			slog.Info("simulator shutting down gracefully")
+			return
+		}
+	}
+}
+
+// writeHeartbeat, simülatörün canlı olduğunu bildirir. Seed verisine dokunmaz.
+// `mode` = deterministic: veri üretimi tek seferlik, servis sadece ayakta.
+func writeHeartbeat(ctx context.Context, pool *pgxpool.Pool, seed int64) error {
+	_, err := pool.Exec(ctx, `
+		INSERT INTO simulator_state (name, mode, seed, ticks, last_tick)
+		VALUES ('default', 'deterministic', $1, 1, now())
+		ON CONFLICT (name) DO UPDATE
+			SET ticks = simulator_state.ticks + 1,
+			    last_tick = now(),
+			    seed = EXCLUDED.seed,
+			    mode = EXCLUDED.mode`,
+		seed,
+	)
+	return err
 }
 
 func runDeterministicSeed(ctx context.Context, pool *pgxpool.Pool, seed int64) error {
