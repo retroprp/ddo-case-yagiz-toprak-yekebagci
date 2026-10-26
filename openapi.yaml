@@ -1,38 +1,565 @@
 openapi: 3.0.3
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BakımPlan CMMS — API sözleşmesi
+#
+# Bu dosya ELLE yazılmıştır ve gerçek router tanımlarıyla (backend/cmd/api/main.go)
+# birebir eşleşir. Amaç iki yönlü:
+#   1. İstemci geliştiren kişi için tek kaynak
+#   2. Sözleşme testi / kod üretimi için makine-okunur girdi
+#
+# Kural: yeni bir uç eklenirse (a) main.go'ya rota, (b) buraya tanım,
+#        (c) kritikse Idempotency-Key kapsamına (middleware/idempotency.go) eklenir.
+# ─────────────────────────────────────────────────────────────────────────────
+
 info:
   title: BakımPlan CMMS API
-  version: 1.0.0
-  description: Ekipman Bakım, Arıza, İş Emri, Yedek Parça Rezervasyonu ve Güvenilirlik (MTBF/MTTR) Yönetim Sistemi API Dokümantasyonu.
+  version: 1.1.0
+  description: |
+    Ekipman Bakım, Arıza, İş Emri, Yedek Parça Rezervasyonu ve Güvenilirlik
+    (MTBF / MTTR / Kullanılabilirlik) yönetim sistemi.
+
+    **Kimlik doğrulama.** `/health` ve `/api/v1/auth/login` dışındaki tüm uçlar
+    `Authorization: Bearer <jwt>` ister. Token `/auth/login` yanıtındaki
+    `access_token` alanındadır (varsayılan ömür 24 saat).
+
+    **Roller.** `teknisyen`, `planlama`, `uretim`, `depo`, `yonetici`.
+    Yetkisiz rol → `403 FORBIDDEN_ROLE`, token yok/geçersiz → `401 UNAUTHORIZED`.
+
+    **Idempotency.** Değiştirici metotlarda (POST/PATCH/DELETE) kritik uçlarda
+    `Idempotency-Key` başlığı **zorunludur**; yoksa `400 IDEMPOTENCY_KEY_REQUIRED`.
+    Aynı anahtar + aynı gövde → kayıtlı yanıt (`X-Idempotent-Replay: true`).
+    Aynı anahtar + farklı gövde → `409 IDEMPOTENCY_CONFLICT`.
+
+    **Hata formatı.** Tüm hatalar tek zarfta döner:
+    `{"error": {"code": "...", "message": "...", "details": {...}}}`
+
+    **Para birimi.** Tutarlar **kuruş** cinsinden `BIGINT`dir (kayan noktalı sayı
+    kullanılmaz). `150000` = 1.500,00 ₺.
+
 servers:
   - url: http://localhost:8080
-    description: Local Docker Compose Server
+    description: Yerel Docker Compose ortamı
+
+tags:
+  - name: Sistem
+  - name: Kimlik
+  - name: Ekipman
+  - name: Arıza
+  - name: İş Emri
+  - name: Önleyici Bakım
+  - name: Stok
+  - name: Metrik
+  - name: Denetim
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ortak bileşenler
+# ─────────────────────────────────────────────────────────────────────────────
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: JWT
+      description: "`/api/v1/auth/login` yanıtındaki `access_token`"
+
+  parameters:
+    # Idempotency-Key her kritik uçta ayrı ayrı tanımlanmak yerine referansla
+    # kullanılıyor ($ref). Tek yerde değiştirilince hepsi güncellenir.
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        İsteğin benzersiz kimliği. Ağ hatasında **aynı** anahtarla tekrar
+        gönderilirse işlem ikinci kez çalışmaz, kayıtlı yanıt döner.
+        Yeni bir işlem için **yeni** anahtar üretin.
+      schema:
+        type: string
+        maxLength: 255
+        example: 6f1a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8
+
+    PathID:
+      name: id
+      in: path
+      required: true
+      description: Kayıt kimliği
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        Keyset sayfalama imleci. İlk istekte gönderilmez; yanıttaki
+        `next_cursor` değeri sonraki isteğe verilir.
+        (Offset değil — `WHERE id < cursor` ile çalışır, derin sayfada yavaşlamaz.)
+      schema:
+        type: integer
+        format: int64
+
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Sayfa başına kayıt (varsayılan 50, üst sınır 200)
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+
+  responses:
+    # Standart hatalar tekrar tekrar yazılmasın diye tanımlı.
+    BadRequest:
+      description: Gövde/parametre hatası
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: equipment_id ve title zorunludur.
+
+    Unauthorized:
+      description: Token yok veya geçersiz
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            error: { code: UNAUTHORIZED, message: Kimlik doğrulama başlığı eksik veya geçersiz. }
+
+    Forbidden:
+      description: Rol yetkisiz
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            error: { code: FORBIDDEN_ROLE, message: Bu işlem için yetkiniz bulunmamaktadır. }
+
+    NotFound:
+      description: Kayıt bulunamadı
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            error: { code: WO_NOT_FOUND, message: İş emri bulunamadı. }
+
+    Conflict:
+      description: İş kuralı çatışması (durum, stok, döngü, idempotency)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            error: { code: CYCLE_DETECTED, message: Hedef ebeveyn bu ekipmanın alt ağacında bulunuyor. }
+
+    Unprocessable:
+      description: Semantik olarak geçersiz (seviye kuralı, BOM, rol)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            error: { code: INVALID_HIERARCHY_LEVEL, message: "'makine' seviyesi yalnızca 'hat' altına bağlanabilir." }
+
+    IdempotencyKeyRequired:
+      description: Kritik uçta `Idempotency-Key` başlığı yok
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            error:
+              code: IDEMPOTENCY_KEY_REQUIRED
+              message: Bu uç için Idempotency-Key başlığı zorunludur.
+
   schemas:
     ErrorResponse:
       type: object
+      required: [error]
       properties:
         error:
           type: object
+          required: [code, message]
           properties:
             code:
               type: string
+              description: Kararlı hata kodu (istemci buna göre dallanır)
+              example: INSUFFICIENT_STOCK
             message:
               type: string
+              description: İnsan-okunur açıklama (Türkçe)
+            details:
+              type: object
+              additionalProperties: true
+              description: İsteğe bağlı ek bilgi
+
+    # ── Kimlik ──────────────────────────────────────────────────────────────
+    User:
+      type: object
+      properties:
+        id: { type: integer, example: 5 }
+        email: { type: string, format: email, example: yonetici@bakimplan.local }
+        full_name: { type: string, example: Canan Öztürk (Yönetici) }
+        role:
+          type: string
+          enum: [teknisyen, planlama, uretim, depo, yonetici]
+
+    LoginResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+          description: HS256 imzalı JWT (24 saat)
+        user: { $ref: '#/components/schemas/User' }
+
+    # ── Ekipman ─────────────────────────────────────────────────────────────
+    EquipmentNode:
+      type: object
+      description: |
+        Ağaç düğümü. `rollup_*` alanları **alt ağacın toplamıdır** (kendisi dahil),
+        `direct_*` yalnızca bu düğümün kendi kayıtlarını gösterir.
+      properties:
+        id: { type: integer, example: 1 }
+        code: { type: string, example: TES-01 }
+        name: { type: string, example: Üretim Tesisi 1 }
+        level_type:
+          type: string
+          enum: [tesis, hat, makine, bilesen]
+          description: Hiyerarşi seviyesi; üst seviye kuralı zorunludur
+        parent_id: { type: integer, nullable: true }
+        shift_hours_per_day: { type: integer, minimum: 1, maximum: 24, example: 16 }
+        is_critical: { type: boolean }
+        status:
+          type: string
+          enum: [aktif, arizali, bakimda, pasif]
+        direct_cost_kurus:
+          type: integer
+          format: int64
+          description: Bu ekipmanın kendi iş emirlerinin toplam maliyeti (kuruş)
+        rollup_cost_kurus:
+          type: integer
+          format: int64
+          description: Alt ağaç dahil toplam maliyet (kuruş)
+        direct_downtime_hours: { type: number, format: double }
+        rollup_downtime_hours: { type: number, format: double }
+        children:
+          type: array
+          items: { $ref: '#/components/schemas/EquipmentNode' }
+
+    EquipmentTreeResponse:
+      type: object
+      properties:
+        tree:
+          type: array
+          items: { $ref: '#/components/schemas/EquipmentNode' }
+        flat_count:
+          type: integer
+          description: Ağaçtaki toplam düğüm sayısı (düz liste uzunluğu)
+
+    # ── İş emri ─────────────────────────────────────────────────────────────
+    WorkOrderStatus:
+      type: string
+      enum: [acik, atandi, devam_ediyor, tamamlandi, iptal]
+      description: |
+        Geçiş matrisi:
+          acik → atandi | iptal
+          atandi → devam_ediyor | acik | iptal
+          devam_ediyor → tamamlandi | iptal
+          tamamlandi, iptal → (terminal)
+        `tamamlandi` yalnızca `/complete` ucuyla yapılabilir.
+
+    WorkOrderListItem:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        code: { type: string, example: WO-1792945692520598 }
+        equipment_id: { type: integer }
+        equipment_name: { type: string }
+        wo_type: { type: string, enum: [corrective, preventive] }
+        status: { $ref: '#/components/schemas/WorkOrderStatus' }
+        priority: { type: string, enum: [dusuk, normal, yuksek, acil] }
+        title: { type: string }
+        assigned_to: { type: integer, nullable: true }
+        labor_cost_kurus: { type: integer, format: int64 }
+        parts_cost_kurus: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+
+    WorkOrderPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/WorkOrderListItem' }
+        next_cursor:
+          type: integer
+          format: int64
+          nullable: true
+          description: Sonraki sayfa için `cursor` parametresi; son sayfada null
+
+    WorkOrderEvent:
+      type: object
+      description: Durum geçmişi kaydı (append-only)
+      properties:
+        id: { type: integer, format: int64 }
+        from_status: { type: string, nullable: true }
+        to_status: { type: string }
+        actor_id: { type: integer, nullable: true }
+        actor_name: { type: string, nullable: true }
+        actor_role: { type: string, nullable: true }
+        note: { type: string }
+        created_at: { type: string, format: date-time }
+
+    # ── Önleyici bakım ──────────────────────────────────────────────────────
+    PMPlan:
+      type: object
+      properties:
+        id: { type: integer }
+        equipment_id: { type: integer }
+        equipment_name: { type: string }
+        name: { type: string }
+        plan_type: { type: string, enum: [time, meter, both] }
+        interval_days: { type: integer, nullable: true }
+        interval_hours: { type: integer, nullable: true }
+        calc_basis:
+          type: string
+          enum: [planned, completed]
+          description: |
+            Sonraki bakım tarihinin hesap tabanı:
+            `planned` = planlanan tarihten (takvim kaymaz),
+            `completed` = fiili tamamlanma tarihinden (gerçeklik).
+        next_due_at: { type: string, format: date-time, nullable: true }
+        next_due_meter: { type: integer, nullable: true }
+
+    # ── Stok ────────────────────────────────────────────────────────────────
+    Part:
+      type: object
+      description: |
+        Stok bir kolon değil, `stock_movements` defterinin toplamıdır.
+        `available = physical - reserved`.
+      properties:
+        id: { type: integer }
+        sku: { type: string }
+        name: { type: string }
+        unit_cost_kurus: { type: integer, format: int64 }
+        reorder_point: { type: integer }
+        is_critical: { type: boolean }
+        physical_stock: { type: integer, description: SUM(quantity_change) }
+        reserved_stock: { type: integer, description: Aktif rezervasyon toplamı }
+        available_stock: { type: integer, description: physical - reserved }
+        needs_reorder: { type: boolean }
+        critical_zero_warning: { type: boolean }
+
+    Warehouse:
+      type: object
+      properties:
+        id: { type: integer }
+        code: { type: string, example: DEPO-ANA }
+        name: { type: string }
+
+    # ── Metrik ──────────────────────────────────────────────────────────────
+    ReliabilityMetrics:
+      type: object
+      description: |
+        Örtüşen duruş aralıkları birleştirilir (çift sayım önlenir).
+        Vardiya dışı süreler payda ve paydan düşülür.
+      properties:
+        equipment_id: { type: integer, description: 0 = tesis geneli }
+        window_days: { type: integer }
+        window_start: { type: string, format: date-time }
+        window_end: { type: string, format: date-time }
+        raw_events_count: { type: integer, description: Filtrelenen ham olay sayısı }
+        merged_failures_count: { type: integer, description: Birleştirme sonrası arıza sayısı }
+        shift_hours_per_day: { type: integer }
+        scheduled_hours: { type: number, format: double }
+        downtime_hours: { type: number, format: double }
+        operating_hours: { type: number, format: double }
+        mtbf_hours: { type: number, format: double }
+        mttr_hours: { type: number, format: double }
+        availability_percent: { type: number, format: double }
+        top_problematic_10:
+          type: array
+          maxItems: 10
+          items:
+            type: object
+            properties:
+              equipment_id: { type: integer }
+              code: { type: string }
+              name: { type: string }
+              level_type: { type: string }
+              failure_wo_count: { type: integer, format: int64 }
+              total_cost_kurus: { type: integer, format: int64 }
+
+    # ── Denetim ─────────────────────────────────────────────────────────────
+    AuditLog:
+      type: object
+      description: Append-only; UPDATE/DELETE veritabanı trigger'ı ile engellenir.
+      properties:
+        id: { type: integer, format: int64 }
+        user_id: { type: integer, nullable: true }
+        action: { type: string, example: "post /api/v1/work-orders" }
+        entity_type: { type: string, example: work-orders }
+        entity_id: { type: string }
+        old_data: { type: object, nullable: true }
+        new_data: { type: object, nullable: true }
+        created_at: { type: string, format: date-time }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Uçlar
+# ─────────────────────────────────────────────────────────────────────────────
 paths:
   /health:
     get:
-      summary: Sistem ve PostgreSQL sağlık durumu kontrolü
+      tags: [Sistem]
+      summary: Servis ve PostgreSQL bağlantı durumu
+      description: |
+        Docker healthcheck bu ucu kullanır. DB ping'i de yapılır; veritabanı
+        erişilemezse `503` döner (container yeniden başlatma kararı için gerekli).
+      security: []
       responses:
         '200':
-          description: Sistem sağlıklı
+          description: Sağlıklı
+          content:
+            application/json:
+              example:
+                status: healthy
+                database: connected
+                service: bakimplan-api
+        '503':
+          description: Veritabanı erişilemiyor
+          content:
+            application/json:
+              example: { status: unhealthy, database: disconnected }
+
   /api/v1/auth/login:
     post:
-      summary: Kullanıcı girişi ve JWT üretimi
+      tags: [Kimlik]
+      summary: Giriş ve JWT üretimi
+      description: |
+        Parola bcrypt ile doğrulanır. Bilinmeyen e-posta ile yanlış parola
+        **aynı** `401 INVALID_CREDENTIALS` yanıtını verir (kullanıcı numaralandırmasını
+        engellemek için).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 1 }
+            example:
+              email: yonetici@bakimplan.local
+              password: Password123!
+      responses:
+        '200':
+          description: Başarılı giriş
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: E-posta veya parola hatalı
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                error: { code: INVALID_CREDENTIALS, message: E-posta veya parola hatalı. }
+
+  /api/v1/auth/me:
+    get:
+      tags: [Kimlik]
+      summary: Oturumdaki kullanıcı
+      description: Token içindeki claim'leri döner; ek veritabanı sorgusu yapmaz.
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Kullanıcı bilgisi
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── Ekipman ───────────────────────────────────────────────────────────────
+  /api/v1/equipments/tree:
+    get:
+      tags: [Ekipman]
+      summary: "[F-1 / T-2] Hiyerarşik ağaç + maliyet/duruş roll-up"
+      description: |
+        `WITH RECURSIVE` ile tüm ağaç döner. Her düğümde `rollup_cost_kurus` ve
+        `rollup_downtime_hours` alt ağaç toplamını içerir.
+        Yanıt büyüktür (2.000 ekipmanda ~570 KB); sık çağrılmamalıdır.
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Ağaç
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EquipmentTreeResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/equipments:
+    post:
+      tags: [Ekipman]
+      summary: "[F-1 / T-2] Yeni ekipman (seviye kuralı zorunlu)"
+      description: |
+        Seviye kuralı: `tesis` kök olmalı (parent_id null),
+        `hat` → tesis, `makine` → hat, `bilesen` → makine.
+        İhlal → `422 INVALID_HIERARCHY_LEVEL`.
+        Roller: `planlama`, `yonetici`.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, name, level_type]
+              properties:
+                code: { type: string, example: MAK-0101 }
+                name: { type: string, example: CNC Makinesi 101 }
+                level_type: { type: string, enum: [tesis, hat, makine, bilesen] }
+                parent_id:
+                  type: integer
+                  nullable: true
+                  description: Üst ekipman; tesis için null
+                shift_hours_per_day: { type: integer, minimum: 1, maximum: 24, default: 16 }
+                is_critical: { type: boolean, default: false }
+      responses:
+        '201':
+          description: Oluşturuldu
+          content:
+            application/json:
+              example: { id: 2001, code: MAK-0101, name: CNC Makinesi 101, level_type: makine, parent_id: 6 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Kod zaten kullanılıyor
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /api/v1/equipments/{id}/move:
+    patch:
+      tags: [Ekipman]
+      summary: "[T-2] Ağaçta taşıma (döngü engelli)"
+      description: |
+        İki koruma:
+        1. Hedef, taşınanın **kendi alt ağacında** ise `409 CYCLE_DETECTED`.
+        2. Seviye matrisi ihlali `422 INVALID_HIERARCHY_LEVEL`.
+        İşlem `SELECT ... FOR UPDATE` ile kilitlenir (eşzamanlı taşıma yarışı).
+        Roller: `planlama`, `yonetici`.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/PathID'
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -40,115 +567,745 @@ paths:
             schema:
               type: object
               properties:
-                email: { type: string }
-                password: { type: string }
+                new_parent_id:
+                  type: integer
+                  nullable: true
+                  description: null = kök yap
+            example: { new_parent_id: 6 }
       responses:
-        '200': { description: Başarılı giriş }
-        '401': { description: Hatalı kimlik bilgisi }
-  /api/v1/equipments/tree:
-    get:
-      summary: "[F-1 / T-2] WITH RECURSIVE ekipman hiyerarşisi ve maliyet/duruş roll-up ağacı"
-      security: [{ bearerAuth: [] }]
-      responses:
-        '200': { description: Hiyerarşik ağaç }
-  /api/v1/equipments/{id}/move:
-    patch:
-      summary: "[T-2] Ekipmanı ağaçta taşıma (Döngü/Cycle engellemeli)"
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: integer }
-      responses:
-        '200': { description: Taşındı }
-        '409': { description: CYCLE_DETECTED (Döngü engellendi) }
+        '200':
+          description: Taşındı
+          content:
+            application/json:
+              example: { id: 301, old_parent_id: 31, new_parent_id: 6, status: moved }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
   /api/v1/equipments/{id}/meter-readings:
     post:
-      summary: "[T-1] Sayaç okuması girme ve idempotent otomatik iş emri üretimi"
+      tags: [Ekipman, Önleyici Bakım]
+      summary: "[T-1] Sayaç okuması → eşik aşılırsa otomatik iş emri"
+      description: |
+        Okuma kaydedilir; `next_due_meter` eşiğini aşan her aktif plan için
+        **idempotent** olarak iş emri üretilir. Kısmi tekil indeks sayesinde
+        plan başına en fazla **1 açık** iş emri bulunur (geciken bakım birikmez).
+        Roller: `teknisyen`, `planlama`, `uretim`, `yonetici`.
       security: [{ bearerAuth: [] }]
       parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: integer }
+        - $ref: '#/components/parameters/PathID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reading_hours]
+              properties:
+                reading_hours: { type: integer, minimum: 0, example: 99999 }
       responses:
-        '200': { description: Sayaç kaydedildi }
+        '200':
+          description: Kaydedildi
+          content:
+            application/json:
+              example: { equipment_id: 31, reading_hours: 99999, generated_work_orders: [6002] }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ── Arıza ─────────────────────────────────────────────────────────────────
   /api/v1/failure-reports:
     get:
-      summary: "[F-2] Arıza bildirimlerini listele"
+      tags: [Arıza]
+      summary: "[F-2] Arıza bildirimleri (son 100)"
       security: [{ bearerAuth: [] }]
       responses:
-        '200': { description: Liste }
+        '200':
+          description: Liste
+          content:
+            application/json:
+              example:
+                items:
+                  - id: 501
+                    equipment_id: 31
+                    equipment_name: CNC / Pres Makinesi #31
+                    title: Ana mil yatağı ısınıyor
+                    severity: yuksek
+                    status: acik
+                    created_at: '2026-10-25T16:28:12Z'
+        '401': { $ref: '#/components/responses/Unauthorized' }
     post:
-      summary: "[F-2] Yeni arıza bildirimi oluştur (Idempotency-Key destekli)"
+      tags: [Arıza]
+      summary: "[F-2] Yeni arıza bildirimi"
+      description: |
+        Roller: `uretim`, `teknisyen`, `planlama`, `yonetici`.
+        `severity` boş bırakılırsa `orta` kabul edilir.
       security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [equipment_id, title]
+              properties:
+                equipment_id: { type: integer }
+                title: { type: string, maxLength: 250 }
+                description: { type: string }
+                severity: { type: string, enum: [dusuk, orta, yuksek, kritik], default: orta }
       responses:
-        '201': { description: Oluşturuldu }
+        '201':
+          description: Oluşturuldu
+          content:
+            application/json:
+              example: { id: 501, equipment_id: 31, title: Ana mil yatağı ısınıyor, severity: yuksek, status: acik }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ── İş emri ───────────────────────────────────────────────────────────────
   /api/v1/work-orders:
     get:
-      summary: "[F-3] İş emirlerini Keyset (Cursor) sayfalama ile listele"
+      tags: [İş Emri]
+      summary: "[F-3] Keyset (cursor) sayfalama ile listele"
+      description: |
+        `cursor` yoksa ilk sayfa döner. `next_cursor` sonraki isteğe verilir.
+        Sıralama `id DESC` — yani en yeni iş emri önce.
       security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
       responses:
-        '200': { description: Sayfalanmış liste }
+        '200':
+          description: Sayfa
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkOrderPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
     post:
-      summary: "[F-3] Yeni iş emri oluştur"
+      tags: [İş Emri]
+      summary: "[F-3] Yeni iş emri"
+      description: |
+        `assigned_to` verilirse durum `atandi`, verilmezse `acik` olur.
+        Roller: `planlama`, `yonetici`.
       security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [equipment_id, title]
+              properties:
+                code: { type: string, description: Boşsa otomatik üretilir (WO-...) }
+                equipment_id: { type: integer }
+                wo_type: { type: string, enum: [corrective, preventive], default: corrective }
+                priority: { type: string, enum: [dusuk, normal, yuksek, acil], default: normal }
+                title: { type: string, maxLength: 250 }
+                assigned_to: { type: integer, nullable: true }
+                labor_cost_kurus: { type: integer, format: int64, minimum: 0, default: 0 }
       responses:
-        '201': { description: Oluşturuldu }
+        '201':
+          description: Oluşturuldu
+          content:
+            application/json:
+              example: { id: 6001, code: WO-1792945692520598, equipment_id: 31, status: acik }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /api/v1/work-orders/{id}/complete:
     post:
-      summary: "[F-3 / T-1] İş emrini tamamla ve planned/completed bazına göre sonraki PM tarihini hesapla"
+      tags: [İş Emri]
+      summary: "[F-3 / T-1] Tamamla (stok tüketimi + PM yeniden planlama)"
+      description: |
+        Yan etkileri vardır, bu yüzden ayrı uçtur:
+          - Rezerve parçalar `consumed` olur ve `stock_movements`'a çıkış yazılır.
+          - İş emri bir PM planına bağlıysa `next_due_at`, `calc_basis` kuralına göre
+            yeniden hesaplanır.
+          - Durum geçmişine kayıt düşer.
+        `iptal` veya `tamamlandi` durumundaki iş emri tamamlanamaz (409).
+        Roller: `teknisyen`, `planlama`, `yonetici`.
       security: [{ bearerAuth: [] }]
       parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: integer }
+        - $ref: '#/components/parameters/PathID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                completed_at: { type: string, format: date-time, description: Boşsa şimdi }
+                labor_cost_kurus: { type: integer, format: int64, minimum: 0 }
       responses:
-        '200': { description: Tamamlandı }
+        '200':
+          description: Tamamlandı
+          content:
+            application/json:
+              example:
+                work_order_id: 6001
+                status: tamamlandi
+                completed_at: '2026-10-25T22:37:31Z'
+                next_pm_scheduled_at: '2026-11-24T22:37:31Z'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: WO_ALREADY_COMPLETED | WO_CANCELLED
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/work-orders/{id}/status:
+    patch:
+      tags: [İş Emri]
+      summary: "[F-3] Durum geçişi (atandi / devam_ediyor / acik / iptal)"
+      description: |
+        Geçiş matrisi dışındaki istekler `409 INVALID_TRANSITION`.
+        `tamamlandi` bu uçtan **yapılamaz** → `409 USE_COMPLETE_ENDPOINT`
+        (stok tüketimi ve PM yeniden planlama yan etkileri `/complete`'a aittir).
+        `devam_ediyor` geçişinde `started_at` ilk kez yazılır.
+        Roller: `teknisyen`, `planlama`, `yonetici`.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/PathID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [acik, atandi, devam_ediyor, iptal] }
+                note: { type: string, description: Geçmiş kaydına düşer }
+            example: { status: devam_ediyor, note: vardiya başında başlandı }
+      responses:
+        '200':
+          description: Geçiş yapıldı
+          content:
+            application/json:
+              example:
+                work_order_id: 6001
+                from_status: atandi
+                to_status: devam_ediyor
+                allowed_next: [tamamlandi, iptal]
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/work-orders/{id}/events:
+    get:
+      tags: [İş Emri]
+      summary: "[F-3] Durum geçmişi (en yeni önce)"
+      description: Aktör adı ve rolü `users` tablosundan çözülür. Son 200 kayıt.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/PathID'
+      responses:
+        '200':
+          description: Geçmiş
+          content:
+            application/json:
+              example:
+                work_order_id: 6001
+                items:
+                  - id: 3
+                    from_status: devam_ediyor
+                    to_status: tamamlandi
+                    actor_id: 1
+                    actor_name: Ahmet Yılmaz (Teknisyen)
+                    actor_role: teknisyen
+                    note: tamamlama
+                    created_at: '2026-10-25T22:37:31Z'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/work-orders/{id}/assign:
+    post:
+      tags: [İş Emri]
+      summary: "[F-6] Teknisyen ata"
+      description: |
+        Yalnızca `teknisyen` rolündeki kullanıcı atanabilir (`422 NOT_A_TECHNICIAN`).
+        `acik` durumundaki iş emri `atandi` olur.
+        `devam_ediyor`, `tamamlandi`, `iptal` durumlarında atama yapılamaz (409).
+        Roller: `planlama`, `yonetici`.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/PathID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [technician_id]
+              properties:
+                technician_id: { type: integer }
+                note: { type: string }
+      responses:
+        '200':
+          description: Atandı
+          content:
+            application/json:
+              example: { work_order_id: 6001, assigned_to: 1, previous_assignee: null, status: atandi }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: WO_NOT_FOUND | TECHNICIAN_NOT_FOUND
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: NOT_A_TECHNICIAN
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+    delete:
+      tags: [İş Emri]
+      summary: "[F-6] Atamayı kaldır"
+      description: |
+        İş emri yeniden `acik` olur, `assigned_to` null'lanır.
+        `devam_ediyor`/`tamamlandi`/`iptal` durumlarında `409 WO_LOCKED`.
+        Zaten atanmamışsa `409 NOT_ASSIGNED`.
+        Roller: `planlama`, `yonetici`.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/PathID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Kaldırıldı
+          content:
+            application/json:
+              example: { work_order_id: 6001, previous_assignee: 1, status: acik }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
   /api/v1/work-orders/{id}/reserve-part:
     post:
-      summary: "[T-3] İş emrine yedek parça rezerve et (SELECT ... FOR UPDATE ve BOM kontrollü)"
+      tags: [Stok, İş Emri]
+      summary: "[T-3] Parça rezerve et (satır kilidi + BOM kontrolü)"
+      description: |
+        `SELECT ... FOR UPDATE` ile parça satırı kilitlenir; kilit altında
+        `available = physical - reserved` yeniden hesaplanır. Eşzamanlı isteklerde
+        stoktan fazla rezervasyon oluşmaz.
+
+        Hata kodları:
+          - `409 INSUFFICIENT_STOCK` — yeterli kullanılabilir stok yok
+          - `422 BOM_INCOMPATIBLE` — parça ekipmanın BOM'unda değil
+          - `409 WO_CLOSED` — iş emri tamamlanmış/iptal
+        Roller: `depo`, `teknisyen`, `planlama`, `yonetici`.
       security: [{ bearerAuth: [] }]
       parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: integer }
+        - $ref: '#/components/parameters/PathID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [part_id, warehouse_id, quantity]
+              properties:
+                part_id: { type: integer }
+                warehouse_id: { type: integer }
+                quantity: { type: integer, minimum: 1 }
       responses:
-        '201': { description: Rezerve edildi }
-        '409': { description: INSUFFICIENT_STOCK }
-        '422': { description: BOM_INCOMPATIBLE }
+        '201':
+          description: Rezerve edildi
+          content:
+            application/json:
+              example:
+                reservation_id: 1
+                work_order_id: 6001
+                part_id: 1
+                warehouse_id: 1
+                reserved_quantity: 2
+                remaining_available: 1
+                reorder_alert: true
+                critical_zero_warning: false
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  # ── Önleyici bakım ────────────────────────────────────────────────────────
+  /api/v1/preventive-plans:
+    get:
+      tags: [Önleyici Bakım]
+      summary: "[F-4] Bakım planları"
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Liste
+          content:
+            application/json:
+              example:
+                items:
+                  - id: 101
+                    equipment_id: 31
+                    equipment_name: CNC / Pres Makinesi #31
+                    name: Aylık Yağ Değişimi
+                    plan_type: time
+                    interval_days: 30
+                    interval_hours: null
+                    calc_basis: planned
+                    next_due_at: '2026-11-24T16:28:12Z'
+                    next_due_meter: null
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Önleyici Bakım]
+      summary: "[F-4 / T-1] Yeni plan"
+      description: |
+        `plan_type` ile periyot türü belirlenir: `time` (gün), `meter` (sayaç saati),
+        `both`. En az bir periyot zorunludur.
+        `calc_basis` sonraki tarihi nasıl hesaplayacağını belirler.
+        Roller: `planlama`, `yonetici`.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [equipment_id, name]
+              properties:
+                equipment_id: { type: integer }
+                name: { type: string, maxLength: 200 }
+                plan_type: { type: string, enum: [time, meter, both], default: both }
+                interval_days: { type: integer, minimum: 1, nullable: true }
+                interval_hours: { type: integer, minimum: 1, nullable: true }
+                calc_basis: { type: string, enum: [planned, completed], default: completed }
+                next_due_at: { type: string, format: date-time, nullable: true }
+                next_due_meter: { type: integer, nullable: true }
+      responses:
+        '201':
+          description: Oluşturuldu
+          content:
+            application/json:
+              example:
+                id: 101
+                equipment_id: 31
+                name: Aylık Yağ Değişimi
+                calc_basis: planned
+                next_due_at: '2026-11-24T16:28:12Z'
+                next_due_meter: null
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/preventive-plans/trigger-due:
+    post:
+      tags: [Önleyici Bakım]
+      summary: "[T-1] Vadesi gelenleri tara ve iş emri üret"
+      description: |
+        `next_due_at <= as_of` olan aktif planlar taranır. Kısmi tekil indeks
+        sayesinde plan başına en fazla 1 açık iş emri bulunur; zaten açık iş emri
+        varsa yenisi oluşmaz (geciken bakım birikmez).
+        `as_of` verilmezse şimdiki zaman kullanılır (test/simülasyon için).
+        Roller: `planlama`, `yonetici`.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: as_of
+          in: query
+          required: false
+          description: Değerlendirme anı (RFC3339). Boşsa now().
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Değerlendirildi
+          content:
+            application/json:
+              example:
+                evaluated_at: '2026-10-25T16:28:12Z'
+                generated_work_orders: [6002, 6003]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ── Stok ──────────────────────────────────────────────────────────────────
   /api/v1/parts:
     get:
-      summary: "[F-5 / T-3] Yedek parça stoğu (Stok = Hareketlerin Toplamı) ve kritik sıfır stok uyarıları"
+      tags: [Stok]
+      summary: "[F-5] Parçalar + stok durumu + uyarılar"
+      description: |
+        Stok **defter toplamıdır**: `physical = SUM(stock_movements.quantity_change)`.
+        `available = physical - reserved`. Kritik parçada sıfır stok ayrıca
+        `critical_zero_warning` ile işaretlenir.
       security: [{ bearerAuth: [] }]
       responses:
-        '200': { description: Parça stok listesi }
+        '200':
+          description: Liste
+          content:
+            application/json:
+              example:
+                items:
+                  - id: 1
+                    sku: PRT-0001
+                    name: Endüstriyel Rulman
+                    unit_cost_kurus: 45000
+                    reorder_point: 5
+                    is_critical: true
+                    physical_stock: 18
+                    reserved_stock: 2
+                    available_stock: 16
+                    needs_reorder: false
+                    critical_zero_warning: false
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
   /api/v1/warehouses:
     get:
-      summary: "Depo listesi (stok hareketi ve parça rezervasyonu formları için salt okunur)"
+      tags: [Stok]
+      summary: Depo listesi (salt okunur)
       security: [{ bearerAuth: [] }]
       responses:
-        '200': { description: Depo listesi }
-        '401': { description: UNAUTHORIZED }
-  /api/v1/technicians/workload:
-    get:
-      summary: "[F-6] Teknisyen aktif ve tamamlanan iş yükü"
+        '200':
+          description: Liste
+          content:
+            application/json:
+              example:
+                items:
+                  - { id: 1, code: DEPO-ANA, name: Merkez Yedek Parça Deposu }
+                  - { id: 2, code: DEPO-HAT, name: Üretim Hatları Acil Stok Deposu }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/stock-movements:
+    post:
+      tags: [Stok]
+      summary: "[F-5] Stok hareketi (giriş/çıkış)"
+      description: |
+        Stok defteri append-only mantığıyla büyür. `quantity_change` işaretlidir:
+        `+` giriş, `-` çıkış.
+        Roller: `depo`, `yonetici`.
       security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [part_id, warehouse_id, quantity_change]
+              properties:
+                part_id: { type: integer }
+                warehouse_id: { type: integer }
+                quantity_change:
+                  type: integer
+                  description: Sıfır olamaz; işaretli (+ giriş, - çıkış)
+                movement_type:
+                  type: string
+                  enum: [initial_seed, purchase, consume, adjustment]
+                  default: purchase
+                work_order_id: { type: integer, format: int64, nullable: true }
+                equipment_id_for_bom:
+                  type: integer
+                  nullable: true
+                  description: Verilirse parça bu ekipmanın BOM'una eklenir
       responses:
-        '200': { description: İş yükü listesi }
+        '201':
+          description: Kaydedildi
+          content:
+            application/json:
+              example: { movement_id: 101, part_id: 2, warehouse_id: 1, quantity_change: 25 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ── Metrik ────────────────────────────────────────────────────────────────
   /api/v1/metrics/reliability:
     get:
-      summary: "[F-7 / T-4] MTBF, MTTR, Kullanılabilirlik (Örtüşen duruş birleştirmeli) ve En Problemli 10 Ekipman"
+      tags: [Metrik]
+      summary: "[F-7 / T-4] MTBF, MTTR, Kullanılabilirlik + En Problemli 10"
+      description: |
+        Örtüşen duruş aralıkları **birleştirilir** (çift sayım önlenir).
+        Vardiya dışı süreler payda ve paydan düşülür.
+
+        Formüller:
+          `MTTR = arıza duruşu / arıza sayısı`
+          `MTBF = (vardiya süresi - duruş) / arıza sayısı`
+          `Availability = (vardiya süresi - duruş) / vardiya süresi`
+
+        `equipment_id` verilmezse tesis geneli hesaplanır.
+        Metrikler **anlık** hesaplanır; geçmiş olay güncellenirse yansır.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: equipment_id
+          in: query
+          required: false
+          description: Tek ekipman için daralt (boşsa tümü)
+          schema: { type: integer }
+        - name: days
+          in: query
+          required: false
+          description: Analiz penceresi (gün). 1–3650.
+          schema: { type: integer, minimum: 1, maximum: 3650, default: 30 }
+      responses:
+        '200':
+          description: Metrikler
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReliabilityMetrics' }
+              example:
+                equipment_id: 0
+                window_days: 30
+                window_start: '2026-09-25T00:00:00Z'
+                window_end: '2026-10-25T23:59:59Z'
+                raw_events_count: 152
+                merged_failures_count: 144
+                shift_hours_per_day: 16
+                scheduled_hours: 480
+                downtime_hours: 311
+                operating_hours: 169
+                mtbf_hours: 1.17
+                mttr_hours: 2.16
+                availability_percent: 35.21
+                top_problematic_10: []
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/downtime-events:
+    post:
+      tags: [Metrik]
+      summary: "[T-4] Duruş olayı ekle"
+      description: |
+        `end_time > start_time` zorunludur. Örtüşen aralıklar metrik hesabında
+        birleştirilir; kayıt sırasında engellenmez (gerçek hayatta olur).
+        Roller: `teknisyen`, `planlama`, `uretim`, `yonetici`.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [equipment_id, start_time, end_time]
+              properties:
+                equipment_id: { type: integer }
+                work_order_id: { type: integer, format: int64, nullable: true }
+                downtime_type: { type: string, enum: [unplanned, planned], default: unplanned }
+                start_time: { type: string, format: date-time }
+                end_time: { type: string, format: date-time }
+                reason: { type: string, maxLength: 255 }
+      responses:
+        '201':
+          description: Kaydedildi
+          content:
+            application/json:
+              example: { id: 2251, status: recorded }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/downtime-events/{id}:
+    patch:
+      tags: [Metrik]
+      summary: "[T-4] Geçmiş duruş olayını düzelt"
+      description: |
+        Metrikler anlık hesaplandığı için düzeltme bir sonraki okumada yansır;
+        ayrı bir yeniden-hesaplama adımı yoktur. Değişiklik denetim kaydına düşer.
+        Roller: `planlama`, `yonetici`.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/PathID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [start_time, end_time]
+              properties:
+                equipment_id: { type: integer }
+                downtime_type: { type: string, enum: [unplanned, planned] }
+                start_time: { type: string, format: date-time }
+                end_time: { type: string, format: date-time }
+                reason: { type: string, description: Boşsa mevcut değer korunur }
+      responses:
+        '200':
+          description: Güncellendi
+          content:
+            application/json:
+              example: { id: 1, status: updated_and_recalculated }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ── İş yükü ───────────────────────────────────────────────────────────────
+  /api/v1/technicians/workload:
+    get:
+      tags: [İş Emri]
+      summary: "[F-6] Teknisyen iş yükü"
+      description: |
+        `active_tasks` = `atandi` + `devam_ediyor` durumundaki iş emirleri.
+        `completed_tasks` = `tamamlandi`.
+        Roller: `teknisyen`, `planlama`, `yonetici`.
       security: [{ bearerAuth: [] }]
       responses:
-        '200': { description: Güvenilirlik metrikleri }
+        '200':
+          description: İş yükü
+          content:
+            application/json:
+              example:
+                items:
+                  - technician_id: 1
+                    full_name: Ahmet Yılmaz (Teknisyen)
+                    email: teknisyen@bakimplan.local
+                    active_tasks: 50
+                    completed_tasks: 5950
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ── Denetim ───────────────────────────────────────────────────────────────
   /api/v1/audit-logs:
     get:
-      summary: Append-only denetim kayıtları (Yalnızca Yönetici)"
+      tags: [Denetim]
+      summary: Denetim kayıtları (yalnızca yönetici)
+      description: |
+        Tablo **append-only**'dir: `BEFORE UPDATE OR DELETE` trigger'ı
+        `RAISE EXCEPTION` atar. Son 100 kayıt, en yeni önce.
       security: [{ bearerAuth: [] }]
       responses:
-        '200': { description: Denetim kayıtları }
-        '403': { description: FORBIDDEN_ROLE }
+        '200':
+          description: Kayıtlar
+          content:
+            application/json:
+              example:
+                items:
+                  - id: 9
+                    user_id: 5
+                    action: "post /api/v1/work-orders"
+                    entity_type: work-orders
+                    entity_id: '6001'
+                    old_data: null
+                    new_data: { path: /api/v1/work-orders, status: 201 }
+                    created_at: '2026-10-25T22:37:31Z'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
