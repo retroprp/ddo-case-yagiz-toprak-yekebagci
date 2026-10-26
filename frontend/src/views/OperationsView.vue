@@ -19,6 +19,11 @@ const pageSize = 25
 
 const equipmentOptions = computed(() => flattenEquipments(equipments.value))
 
+// İş yükü çubuğu için en yüklü teknisyen (oran hesabında payda).
+const maxActiveTasks = computed(() =>
+  items.value.reduce((max, row) => Math.max(max, Number(row.active_tasks) || 0), 1)
+)
+
 const sectionMeta = {
   workorders: {
     title: 'İş Emirleri',
@@ -686,13 +691,27 @@ onMounted(refresh)
 
         <!-- Teknisyen iş yükü -->
         <div v-else-if="section === 'workload'" class="space-y-2">
-          <div v-for="row in items" :key="row.technician_id" class="flex items-center gap-3 border border-slate-200 rounded-lg p-3">
+          <div
+            v-for="row in items"
+            :key="row.technician_id"
+            class="flex items-center gap-3 border border-slate-200 rounded-lg p-3"
+          >
             <div class="w-9 h-9 rounded-full bg-slate-900 text-white flex items-center justify-center text-xs font-bold shrink-0">
               {{ (row.full_name || '?').charAt(0) }}
             </div>
             <div class="min-w-0">
               <div class="text-xs font-semibold text-slate-800 truncate">{{ row.full_name }}</div>
               <div class="text-[10px] text-slate-400 truncate">{{ row.email }}</div>
+            </div>
+            <!-- İş yükü çubuğu: sayı okumak yerine oranı görmek daha hızlı karar verdirir -->
+            <div class="flex-1 min-w-[80px] hidden sm:block">
+              <div class="h-1.5 rounded-full bg-slate-100 overflow-hidden">
+                <div
+                  class="h-full rounded-full"
+                  :class="row.active_tasks > 40 ? 'bg-rose-500' : row.active_tasks > 20 ? 'bg-amber-500' : 'bg-emerald-500'"
+                  :style="{ width: Math.min(100, (row.active_tasks / Math.max(1, maxActiveTasks)) * 100) + '%' }"
+                ></div>
+              </div>
             </div>
             <div class="ml-auto flex items-center gap-4 shrink-0 text-center">
               <div>
@@ -705,6 +724,9 @@ onMounted(refresh)
               </div>
             </div>
           </div>
+          <p class="text-[10px] text-slate-400 text-center">
+            {{ items.length }} teknisyen · çubuk, en yüklü teknisyene göre oranı gösterir
+          </p>
         </div>
       </section>
 
@@ -794,8 +816,26 @@ onMounted(refresh)
           </form>
         </div>
 
-        <div v-if="section === 'workload'" class="bg-white rounded-xl border border-dashed border-slate-300 p-4 text-[11px] text-slate-400">
-          İş yükü dağılımı atanmış iş emirlerinden hesaplanır. Atama işlemleri iş emri oluşturulurken yapılır.
+        <div v-if="section === 'workload'" class="bg-white rounded-xl border border-slate-200 shadow-sm p-4 text-[11px] text-slate-500 space-y-2">
+          <div class="font-semibold text-slate-700 text-xs">Nasıl hesaplanır?</div>
+          <p>
+            <strong>Aktif</strong>: <span class="font-mono">atandi</span> ve
+            <span class="font-mono">devam_ediyor</span> durumundaki iş emirleri.
+          </p>
+          <p>
+            <strong>Tamamlanan</strong>: <span class="font-mono">tamamlandi</span> durumundaki iş emirleri.
+          </p>
+          <p class="text-slate-400">
+            Atama <strong>İş Emirleri</strong> ekranındaki "Ata" butonundan yapılır;
+            atanan iş sayısı burada anında güncellenir.
+          </p>
+          <router-link
+            v-if="hasRole('planlama', 'yonetici')"
+            to="/workorders"
+            class="inline-block text-[11px] font-semibold text-indigo-600 hover:underline"
+          >
+            İş Emirleri ekranına git →
+          </router-link>
         </div>
 
         <div

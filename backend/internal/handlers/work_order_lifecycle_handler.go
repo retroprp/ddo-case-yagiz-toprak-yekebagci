@@ -168,6 +168,12 @@ func (h *WorkOrderLifecycleHandler) UpdateStatus(w http.ResponseWriter, r *http.
 		return
 	}
 
+	middleware.RecordAudit(r.Context(), h.Pool, requestActorID(r), "CHANGE_WO_STATUS", "work_order",
+		strconv.FormatInt(woID, 10),
+		map[string]any{"status": current},
+		map[string]any{"status": target, "note": strings.TrimSpace(req.Note)},
+	)
+
 	middleware.WriteJSON(w, http.StatusOK, map[string]any{
 		"work_order_id": woID,
 		"from_status":   current,
@@ -283,6 +289,12 @@ func (h *WorkOrderLifecycleHandler) AssignTechnician(w http.ResponseWriter, r *h
 		return
 	}
 
+	middleware.RecordAudit(r.Context(), h.Pool, requestActorID(r), "ASSIGN_TECHNICIAN", "work_order",
+		strconv.FormatInt(woID, 10),
+		map[string]any{"assigned_to": previous, "status": current},
+		map[string]any{"assigned_to": *req.TechnicianID, "status": nextStatus, "note": note},
+	)
+
 	middleware.WriteJSON(w, http.StatusOK, map[string]any{
 		"work_order_id":     woID,
 		"assigned_to":       *req.TechnicianID,
@@ -348,6 +360,12 @@ func (h *WorkOrderLifecycleHandler) Unassign(w http.ResponseWriter, r *http.Requ
 		middleware.WriteError(w, http.StatusInternalServerError, "COMMIT_ERROR", err.Error())
 		return
 	}
+
+	middleware.RecordAudit(r.Context(), h.Pool, requestActorID(r), "UNASSIGN_TECHNICIAN", "work_order",
+		strconv.FormatInt(woID, 10),
+		map[string]any{"assigned_to": previous, "status": current},
+		map[string]any{"assigned_to": nil, "status": "acik"},
+	)
 
 	middleware.WriteJSON(w, http.StatusOK, map[string]any{
 		"work_order_id":     woID,

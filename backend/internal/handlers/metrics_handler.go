@@ -125,6 +125,17 @@ func (h *MetricsHandler) CreateDowntimeEvent(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	middleware.RecordAudit(r.Context(), h.Pool, requestActorID(r), "CREATE_DOWNTIME", "downtime_event",
+		strconv.FormatInt(id, 10), nil,
+		map[string]any{
+			"equipment_id":  req.EquipmentID,
+			"work_order_id": req.WorkOrderID,
+			"start_time":    req.StartTime.UTC(),
+			"end_time":      req.EndTime.UTC(),
+			"reason":        req.Reason,
+		},
+	)
+
 	middleware.WriteJSON(w, http.StatusCreated, map[string]any{"id": id, "status": "recorded"})
 }
 

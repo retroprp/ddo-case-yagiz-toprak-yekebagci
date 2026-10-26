@@ -1,6 +1,6 @@
 <script setup>
 import { ref, watch, onMounted } from 'vue'
-import { store, apiFetch, formatTL } from '../store'
+import { store, apiFetch, formatTL, formatDate } from '../store'
 
 const props = defineProps({ section: { type: String, default: 'inventory' } })
 
@@ -103,6 +103,92 @@ async function submitStockMovement() {
 
 watch(() => props.section, () => loadData())
 onMounted(() => loadData())
+
+// ── Denetim kaydı: JSONB okunabilir gösterim ────────────────────────────────
+// Ham JSON.stringify çıktısı ekranda okunmuyor ('{"path":"/api/v1/..."}').
+// Bunun yerine anahtar/değer çiftleri gösteriyoruz; bilinen alanlara Türkçe
+// etiket veriyoruz.
+const auditFieldLabels = {
+  path: 'Uç',
+  status: 'Durum',
+  status_code: 'HTTP',
+  code: 'Kod',
+  name: 'Ad',
+  title: 'Başlık',
+  level_type: 'Seviye',
+  parent_id: 'Üst',
+  is_critical: 'Kritik',
+  shift_hours_per_day: 'Vardiya (sa)',
+  equipment_id: 'Ekipman',
+  equipment_id_for_bom: 'BOM ekipmanı',
+  part_id: 'Parça',
+  warehouse_id: 'Depo',
+  quantity: 'Miktar',
+  quantity_change: 'Miktar',
+  reservation_id: 'Rezervasyon',
+  available_after: 'Kalan stok',
+  available_before: 'Önceki stok',
+  work_order_id: 'İş emri',
+  assigned_to: 'Teknisyen',
+  previous_assignee: 'Önceki teknisyen',
+  wo_type: 'İş emri tipi',
+  movement_type: 'Hareket tipi',
+  plan_type: 'Plan tipi',
+  start_time: 'Başlangıç',
+  end_time: 'Bitiş',
+  reason: 'Sebep',
+  severity: 'Önem',
+  priority: 'Öncelik',
+  failure_code: 'Arıza kodu',
+  calc_basis: 'Hesap tabanı',
+  interval_days: 'Periyot (gün)',
+  interval_hours: 'Periyot (saat)',
+  next_due_at: 'Sonraki tarih',
+  next_due_meter: 'Sonraki sayaç',
+  completed_at: 'Tamamlanma',
+  next_pm_scheduled_at: 'Sonraki bakım',
+  labor_cost_kurus: 'İşçilik',
+  parts_cost_kurus: 'Parça maliyeti',
+  note: 'Not',
+  row_count: 'Satır'
+}
+
+// Değeri insan-okunur biçime çevirir.
+// Tarih alanları ISO string gelir; ekranda "26.10.2026 15:12" görmek
+// "2026-10-26T15:12:32Z" görmekten iyidir.
+function auditValue(key, value) {
+  if (value === null || value === undefined) return '—'
+  if (typeof value === 'boolean') return value ? 'evet' : 'hayır'
+  if (typeof value === 'object') return JSON.stringify(value)
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value)) {
+    return formatDate(value)
+  }
+  // Kuruş alanları: 150000 → "1.500,00 ₺"
+  if (typeof value === 'number' && key.endsWith('_kurus')) return formatTL(value)
+  return String(value)
+}
+
+function auditRows(data) {
+  if (!data || typeof data !== 'object') return []
+  const rows = Object.entries(data).map(([key, value]) => ({
+    key,
+    label: auditFieldLabels[key] || key,
+    value: auditValue(key, value),
+    empty: value === null || value === undefined
+  }))
+  // Boş alanları sona at: okunurken anlamlı bilgiler önce gelsin.
+  // (Sıralama stabil: aynı değere sahip alanlar orijinal sırasını korur.)
+  return rows.sort((a, b) => Number(a.empty) - Number(b.empty))
+}
+
+// "post /api/v1/work-orders" → "POST /work-orders"
+// Ham eylem adları (UPDATE_DOWNTIME) olduğu gibi kalır.
+function auditAction(action) {
+  if (!action) return '—'
+  const m = action.match(/^(get|post|patch|put|delete)\s+(.+)$/i)
+  if (!m) return action
+  return m[1].toUpperCase() + ' ' + m[2].replace('/api/v1', '')
+}
 </script>
 
 <template>
@@ -216,20 +302,59 @@ onMounted(() => loadData())
       <table class="w-full text-xs text-left">
         <thead class="bg-slate-50 text-slate-600 uppercase border-b">
           <tr>
-            <th class="p-2">ID</th>
-            <th class="p-2">Kullanıcı</th>
+            <th class="p-2 w-16">ID</th>
+            <th class="p-2 w-24">Kullanıcı</th>
             <th class="p-2">İşlem</th>
             <th class="p-2">Varlık</th>
-            <th class="p-2">Yeni Değer (JSONB)</th>
+            <th class="p-2">Zaman</th>
+            <th class="p-2">Değişiklik</th>
           </tr>
         </thead>
         <tbody class="divide-y">
-          <tr v-for="log in auditLogs" :key="log.id">
-            <td class="p-2 font-mono font-bold">#{{ log.id }}</td>
-            <td class="p-2 font-mono">User #{{ log.user_id || '-' }}</td>
-            <td class="p-2 font-bold text-indigo-700">{{ log.action }}</td>
-            <td class="p-2 font-mono">{{ log.entity_type }} #{{ log.entity_id }}</td>
-            <td class="p-2 font-mono text-[11px] text-slate-600 truncate max-w-md">{{ JSON.stringify(log.new_data) }}</td>
+          <tr v-for="log in auditLogs" :key="log.id" class="align-top hover:bg-slate-50">
+            <td class="p-2 font-mono font-bold text-slate-500">#{{ log.id }}</td>
+            <td class="p-2 font-mono text-slate-600">User #{{ log.user_id || '-' }}</td>
+            <td class="p-2">
+              <!-- Ham eylem adı okunur biçime çevrilir; teknik ayrıntı tooltip'te -->
+              <span
+                class="font-semibold text-indigo-700 font-mono text-[11px]"
+                :title="log.action"
+              >{{ auditAction(log.action) }}</span>
+            </td>
+            <td class="p-2 font-mono text-[11px] text-slate-600">
+              {{ log.entity_type }}<span v-if="log.entity_id"> #{{ log.entity_id }}</span>
+            </td>
+            <td class="p-2 text-[11px] text-slate-500 whitespace-nowrap">
+              {{ formatDate(log.created_at) }}
+            </td>
+            <td class="p-2">
+              <!--
+                JSONB'yi ham metin yerine anahtar/değer çiftleri olarak göster:
+                ekranda okunabilir, alan adları Türkçe etiketli.
+                Eski değer de varsa (güncellemeler) iki sütun olarak yan yana.
+              -->
+              <div v-if="!log.old_data && !log.new_data" class="text-slate-300">—</div>
+              <div v-else class="flex flex-wrap gap-x-6 gap-y-2">
+                <div v-if="log.old_data" class="min-w-[180px]">
+                  <div class="text-[10px] uppercase tracking-wide text-slate-400 mb-1">Önce</div>
+                  <dl class="space-y-0.5">
+                    <div v-for="row in auditRows(log.old_data)" :key="'o-' + row.key" class="flex gap-1.5 leading-tight">
+                      <dt class="text-[10px] text-slate-400 shrink-0">{{ row.label }}:</dt>
+                      <dd class="text-[11px] text-slate-500 line-through" :class="row.empty ? 'opacity-40' : ''">{{ row.value }}</dd>
+                    </div>
+                  </dl>
+                </div>
+                <div v-if="log.new_data" class="min-w-[180px]">
+                  <div v-if="log.old_data" class="text-[10px] uppercase tracking-wide text-slate-400 mb-1">Sonra</div>
+                  <dl class="space-y-0.5">
+                    <div v-for="row in auditRows(log.new_data)" :key="'n-' + row.key" class="flex gap-1.5 leading-tight">
+                      <dt class="text-[10px] text-slate-400 shrink-0">{{ row.label }}:</dt>
+                      <dd class="text-[11px] text-slate-700 font-medium break-all" :class="row.empty ? 'opacity-40' : ''">{{ row.value }}</dd>
+                    </div>
+                  </dl>
+                </div>
+              </div>
+            </td>
           </tr>
         </tbody>
       </table>

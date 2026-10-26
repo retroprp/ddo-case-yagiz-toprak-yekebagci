@@ -70,7 +70,7 @@ function fillDemoAccount(acc) {
   loginError.value = ''
 }
 
-// RBAC testi: /audit-logs yalnızca yöneticiye açıktır.
+// RBAC testi: Denetim Kaydı ekranı yalnızca yöneticiye açıktır.
 // 403 burada BEKLENEN bir sonuçtur; bu yüzden hata banner'ı değil,
 // nötr bir bilgi kutusu gösterilir (silent: true).
 async function testRbac() {
@@ -81,15 +81,21 @@ async function testRbac() {
     await apiFetch('/audit-logs', { silent: true })
     rbacTest.value = {
       kind: 'ok',
-      title: '200 OK',
-      text: `"${roleText.value}" rolü /api/v1/audit-logs ucuna yetkili; sunucu kayıtları döndürdü.`
+      title: 'Erişim verildi (200)',
+      text: `Denetim Kaydı ekranı "${roleText.value}" rolüne açık; sunucu kayıtları döndürdü.`
     }
   } catch (err) {
     if (err.status === 403) {
       rbacTest.value = {
         kind: 'expected',
-        title: '403 Forbidden (beklenen)',
-        text: `"${roleText.value}" rolü /api/v1/audit-logs ucuna yetkili değil. Sunucu isteği reddetti — RBAC çalışıyor.`
+        title: 'Erişim reddedildi (403) — beklenen',
+        text: `Denetim Kaydı yalnızca yöneticiye açıktır. "${roleText.value}" rolüyle istek atıldı, sunucu reddetti. Yetkilendirme doğru çalışıyor.`
+      }
+    } else if (err.status === 401) {
+      rbacTest.value = {
+        kind: 'unexpected',
+        title: 'Oturum geçersiz (401)',
+        text: 'Token süresi dolmuş olabilir; çıkış yapıp tekrar giriş yapın.'
       }
     } else {
       rbacTest.value = {
@@ -248,24 +254,30 @@ onMounted(async () => {
                 :disabled="rbacTestRunning"
                 class="text-[11px] text-indigo-600 hover:underline disabled:opacity-50"
               >
-                {{ rbacTestRunning ? 'Test ediliyor...' : '403 Yetki Testi' }}
+                {{ rbacTestRunning ? 'Test ediliyor...' : 'Yetki Testi' }}
               </button>
             </div>
           </div>
 
           <nav class="space-y-1">
+            <!--
+              Menüde yalnızca ekran adı gösterilir. F-1 / T-4 gibi kapsam
+              kodları kullanıcıya bir şey ifade etmiyor; değerlendirme için
+              gereken eşleme sayfa başlığında (ör. "İş Emirleri  F-3") duruyor.
+            -->
             <router-link
               v-for="r in visibleRoutes"
               :key="r.path"
               :to="r.path"
               @click="mobileMenuOpen = false"
-              class="w-full text-left px-3 py-2.5 rounded-lg text-xs font-semibold flex items-center justify-between transition"
+              class="w-full text-left px-3 py-2.5 rounded-lg text-xs font-semibold flex items-center justify-between gap-2 transition"
               :class="route.path === r.path ? 'bg-slate-900 text-white shadow-sm' : 'text-slate-600 hover:bg-slate-100'"
             >
-              <span>{{ r.title }}</span>
-              <span :class="['text-[10px] px-1.5 py-0.5 rounded font-mono', route.path === r.path ? 'bg-emerald-500 text-slate-950 font-bold' : 'bg-slate-200 text-slate-600']">
-                {{ r.code }}
-              </span>
+              <span class="truncate">{{ r.title }}</span>
+              <span
+                v-if="route.path === r.path"
+                class="text-[10px] text-emerald-300 font-mono shrink-0"
+              >{{ r.code }}</span>
             </router-link>
           </nav>
 

@@ -60,6 +60,16 @@ func (h *MaintenanceHandler) CreateFailureReport(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// Denetim: ne açıldı, hangi ekipman için, hangi önem derecesiyle.
+	middleware.RecordAudit(r.Context(), h.Pool, &userID, "CREATE_FAILURE_REPORT", "failure_report",
+		strconv.FormatInt(id, 10), nil,
+		map[string]any{
+			"equipment_id": req.EquipmentID,
+			"title":        req.Title,
+			"severity":     req.Severity,
+		},
+	)
+
 	middleware.WriteJSON(w, http.StatusCreated, map[string]any{
 		"id":           id,
 		"equipment_id": req.EquipmentID,
@@ -222,6 +232,25 @@ func (h *MaintenanceHandler) CreateWorkOrder(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Denetim: iş emrinin açılış anındaki hâli (durum, tip, öncelik, atama).
+	var uid *int
+	if claims, ok := auth.GetUserFromContext(r.Context()); ok && claims != nil {
+		uid = &claims.UserID
+	}
+	middleware.RecordAudit(r.Context(), h.Pool, uid, "CREATE_WORK_ORDER", "work_order",
+		strconv.FormatInt(id, 10), nil,
+		map[string]any{
+			"code":             req.Code,
+			"equipment_id":     req.EquipmentID,
+			"wo_type":          req.WoType,
+			"priority":         req.Priority,
+			"status":           status,
+			"title":            req.Title,
+			"assigned_to":      req.AssignedTo,
+			"labor_cost_kurus": req.LaborCostKurus,
+		},
+	)
+
 	middleware.WriteJSON(w, http.StatusCreated, map[string]any{
 		"id":           id,
 		"code":         req.Code,
@@ -362,6 +391,25 @@ func (h *MaintenanceHandler) CompleteWorkOrder(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Denetim: tamamlanan iş emrinin son hâli ve (varsa) tetiklenen PM tarihi.
+	// pmPlanID bilgisi kaybolmasın diye commit sonrası yazılıyor; aynı
+	// transaction'a koysaydık REFRESH gibi commit-sonrası işlemlerle sıra
+	// karışabilirdi.
+	var cuid *int
+	if claims, ok := auth.GetUserFromContext(r.Context()); ok && claims != nil {
+		cuid = &claims.UserID
+	}
+	middleware.RecordAudit(r.Context(), h.Pool, cuid, "COMPLETE_WORK_ORDER", "work_order",
+		strconv.FormatInt(woID, 10),
+		map[string]any{"status": currentStatus},
+		map[string]any{
+			"status":               "tamamlandi",
+			"completed_at":         completedTime,
+			"labor_cost_kurus":     currentLabor,
+			"next_pm_scheduled_at": nextDueAt,
+		},
+	)
+
 	middleware.WriteJSON(w, http.StatusOK, map[string]any{
 		"work_order_id":        woID,
 		"status":               "tamamlandi",
@@ -416,6 +464,20 @@ func (h *MaintenanceHandler) CreatePMPlan(w http.ResponseWriter, r *http.Request
 		middleware.WriteError(w, http.StatusBadRequest, "PM_CREATE_ERROR", err.Error())
 		return
 	}
+
+	middleware.RecordAudit(r.Context(), h.Pool, requestActorID(r), "CREATE_PM_PLAN", "preventive_plan",
+		strconv.Itoa(id), nil,
+		map[string]any{
+			"equipment_id":   req.EquipmentID,
+			"name":           req.Name,
+			"plan_type":      req.PlanType,
+			"interval_days":  req.IntervalDays,
+			"interval_hours": req.IntervalHours,
+			"calc_basis":     req.CalcBasis,
+			"next_due_at":    req.NextDueAt,
+			"next_due_meter": req.NextDueMeter,
+		},
+	)
 
 	middleware.WriteJSON(w, http.StatusCreated, map[string]any{
 		"id":             id,

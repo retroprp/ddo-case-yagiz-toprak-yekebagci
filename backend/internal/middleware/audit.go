@@ -11,6 +11,41 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// auditState, bir istek içinde handler'ın kendi denetim kaydını yazıp
+// yazmadığını taşır.
+//
+// Neden gerekli: AuditTrail her mutasyonu "güvenlik ağı" olarak kaydeder.
+// Handler'lar da iş kuralına özel ayrıntılı kayıt yazar (eski/yeni değer).
+// İkisi birlikte çalışınca aynı işlem iki satır oluyordu:
+//
+//	#164  patch /api/v1/downtime-events/{id}  {"path":..,"status":200}
+//	#163  UPDATE_DOWNTIME                     {"start_time":..,"end_time":..}
+//
+// Çözüm: handler kayıt yazdığında bu bayrağı kaldırır; middleware görürse
+// ikinci satırı yazmaz. Ağ güvenliği korunur (handler unutan uçlar yine
+// middleware tarafından kaydedilir), gürültü kalkar.
+//
+// Context değerleri değiştirilemediği için bayrak bir pointer üzerinden
+// taşınır: aynı istek içindeki tüm katmanlar aynı nesneyi görür.
+type auditState struct {
+	handlerLogged bool
+}
+
+type auditStateKey struct{}
+
+// WithAuditState, istek context'ine bayrak taşıyıcısı ekler.
+func WithAuditState(ctx context.Context) (context.Context, *auditState) {
+	st := &auditState{}
+	return context.WithValue(ctx, auditStateKey{}, st), st
+}
+
+// markHandlerLogged, handler'ın kendi kaydını yazdığını bildirir.
+func markHandlerLogged(ctx context.Context) {
+	if st, ok := ctx.Value(auditStateKey{}).(*auditState); ok {
+		st.handlerLogged = true
+	}
+}
+
 func RecordAudit(ctx context.Context, pool *pgxpool.Pool, userID *int, action, entityType, entityID string, oldData, newData any) {
 	var oldJSON, newJSON []byte
 	if oldData != nil {
@@ -25,6 +60,9 @@ func RecordAudit(ctx context.Context, pool *pgxpool.Pool, userID *int, action, e
 		 VALUES ($1, $2, $3, $4, $5, $6)`,
 		userID, action, entityType, entityID, oldJSON, newJSON,
 	)
+
+	// Aynı istek için middleware'in ikinci (generic) kaydı yazmasını engelle.
+	markHandlerLogged(ctx)
 }
 
 func RecordAuditTx(ctx context.Context, tx pgx.Tx, userID *int, action, entityType, entityID string, oldData, newData any) error {
@@ -41,6 +79,9 @@ func RecordAuditTx(ctx context.Context, tx pgx.Tx, userID *int, action, entityTy
 		 VALUES ($1, $2, $3, $4, $5, $6)`,
 		userID, action, entityType, entityID, oldJSON, newJSON,
 	)
+	if err == nil {
+		markHandlerLogged(ctx)
+	}
 	return err
 }
 
@@ -67,8 +108,12 @@ func (s *auditStatusRecorder) Write(b []byte) (int, error) {
 }
 
 // AuditTrail, kimliği doğrulanmış her değiştirici isteği (POST/PATCH/PUT/DELETE)
-// başarıyla sonuçlandığında audit_logs'a yazar. Handler'ların yazdığı ayrıntılı
-// kayıtlara ek olarak "kim, ne zaman, hangi uç" izini garanti eder.
+// başarıyla sonuçlandığında audit_logs'a yazar.
+//
+// Bu bir "güvenlik ağı"dır: handler kendi ayrıntılı kaydını yazmayı unutursa
+// bile kim + hangi uç + hangi sonuç izi kalır. Handler kayıt yazdıysa
+// (RecordAudit/RecordAuditTx bayrağı kaldırır) ikinci generic satır yazılmaz —
+// aksi hâlde her işlem iki kez görünür.
 //
 // auth.Authenticate middleware'inden SONRA bağlanmalıdır; aksi hâlde userID
 // her zaman nil olur.
@@ -82,11 +127,17 @@ func AuditTrail(pool *pgxpool.Pool, userID UserIDFunc) func(http.Handler) http.H
 				return
 			}
 
+			ctx, state := WithAuditState(r.Context())
 			rec := &auditStatusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
-			next.ServeHTTP(rec, r)
+			next.ServeHTTP(rec, r.WithContext(ctx))
 
 			// Yalnızca gerçekten bir kayıt oluştuysa iz bırak.
 			if rec.statusCode < 200 || rec.statusCode >= 300 {
+				return
+			}
+
+			// Handler kendi ayrıntılı kaydını yazdıysa tekrar yazma.
+			if state.handlerLogged {
 				return
 			}
 
@@ -104,11 +155,11 @@ func AuditTrail(pool *pgxpool.Pool, userID UserIDFunc) func(http.Handler) http.H
 				action = strings.ToLower(r.Method) + " " + pattern
 			}
 
-			RecordAudit(r.Context(), pool, uid, action, entityType, chi.URLParam(r, "id"),
+			RecordAudit(ctx, pool, uid, action, entityType, chi.URLParam(r, "id"),
 				nil,
 				map[string]any{
-					"path":   r.URL.Path,
-					"status": rec.statusCode,
+					"path":        r.URL.Path,
+					"status_code": rec.statusCode,
 				},
 			)
 		})
