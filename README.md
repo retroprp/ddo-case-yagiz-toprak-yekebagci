@@ -605,25 +605,102 @@ Sonuç: testler istediği kadar veri yazsın, **demo verisi değişmez**.
 
 ## 9. Telefondan (Mobil) Erişim
 
-Uygulama responsive tasarlandı; ancak `localhost` telefondan **telefonun kendisi** demektir.
-Bu yüzden API adresini bilgisayarın yerel IP'si ile yeniden derlemek gerekir.
+Uygulama responsive tasarlandı (menü hamburger'a düşer, tablolar yatay kaydırılır).
+Telefondan açmak için **tek bir şey** gerekir: bilgisayarın yerel IP'si.
 
-```bash
-# 1) Bilgisayarın yerel IP'sini bul (Windows)
-ipconfig | findstr IPv4        # örn. 192.168.1.42
-
-# 2) Frontend'i bu adresle yeniden derle
-#    .env dosyasına ekle:
-#    VITE_API_URL=http://192.168.1.42:8080/api/v1
-docker compose up -d --build frontend
-
-# 3) Windows Güvenlik Duvarı'nda 3000 ve 8080 portlarına izin ver
-# 4) Telefonun tarayıcısından aç:
-#    http://192.168.1.42:3000
+```
+http://<bilgisayarın-IP'si>:3000
 ```
 
-Telefon ve bilgisayar **aynı Wi-Fi ağında** olmalı. Ayrıntılı anlatım ve sorun giderme
-için [Sorun Giderme → Mobil](#mobil-telefondan-açılmıyor) bölümüne bakın.
+### Neden IP'yi koda yazmıyoruz?
+
+Önceden API adresi (`http://192.168.1.42:8080/api/v1`) derleme anında JavaScript'in
+içine gömülüyordu. Bu kırılgandı: IP değişince (Wi-Fi ↔ Ethernet, DHCP) yeniden
+derlemek gerekiyordu ve yanlış IP ile derlenmiş bir imaj telefonda hiç çalışmıyordu.
+
+Artık frontend'in nginx'i `/api/` isteklerini compose ağındaki backend'e vekilliyor
+(`frontend/nginx.conf`). Arayüz göreli adres kullanır:
+
+```js
+// frontend/src/store.js
+export const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8080/api/v1'
+// .env → VITE_API_URL=/api/v1   (göreli)
+```
+
+Sonuçları:
+
+| Kazanç | Açıklama |
+|---|---|
+| IP'den bağımsız | Hangi IP/hostname ile açılırsa açılsın çalışır, yeniden derleme yok |
+| CORS yok | İstek aynı kökene (`:3000`) gider; tarayıcı preflight yapmaz |
+| Tek port yeter | Dışarıya yalnızca 3000 açılır; 8080'e telefon için gerek kalmaz |
+| Daha az trafik | nginx JSON yanıtlarını gzip'ler (565 KB'lık ekipman ağacı küçülür) |
+
+Doğrulama (proxy'nin çalıştığını gösterir):
+
+```bash
+curl -s -X POST http://localhost:3000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"yonetici@bakimplan.local","password":"Password123!"}'
+# → {"access_token":"...","user":{...}}
+```
+
+### Adım adım: telefondan açma
+
+```bash
+# 1) Bilgisayarın LAN IP'sini bul (Windows)
+ipconfig | findstr IPv4
+#    Kullanılan adaptörün IPv4'ünü al:  örn. 192.168.1.4
+#    NOT: "Deprecated" görünen (kopmuş Wi-Fi gibi) adaptörün IP'sini kullanma.
+
+# 2) Servislerin ayakta olduğunu doğrula
+docker compose ps
+#    frontend, backend, db "healthy" olmalı
+
+# 3) Telefonla aynı ağda olduğundan emin ol, sonra tarayıcıda aç:
+#    http://192.168.1.4:3000
+```
+
+**Yeniden derleme gerekmez.** `.env`'ye IP yazmak da gerekmez.
+
+### Windows Güvenlik Duvarı (en sık takılma noktası)
+
+Docker'ın gelen (inbound) kuralları **yalnızca `Private` profilde** izin verir;
+ağ `Public` ise telefonun isteği sessizce düşer (tarayıcıda "bağlanamadı").
+Kontrol:
+
+```powershell
+Get-NetConnectionProfile | Select-Object Name, InterfaceAlias, NetworkCategory
+```
+
+`NetworkCategory` **Public** ise, **yönetici olarak** (PowerShell → Sağ tık →
+"Yönetici olarak çalıştır") şu komutu çalıştır — en güvenli seçenek ağı
+Private yapmaktır:
+
+```powershell
+Set-NetConnectionProfile -InterfaceAlias "Ethernet" -NetworkCategory Private
+```
+
+Alternatif (ağ profilini değiştirmeden yalnızca portları açmak):
+
+```powershell
+New-NetFirewallRule -DisplayName "BakimPlan Frontend 3000" -Direction Inbound `
+  -Protocol TCP -LocalPort 3000 -Action Allow -Profile Private,Public
+```
+
+> Ev/ofis ağında `Public` profili değiştirmek genelde sorunsuzdur. Ortak
+> (kafe, okul) ağlarda güvenlik nedeniyle profil Public kalmalı — o durumda
+> ikinci komutu kullanın veya telefonu bir hotspot üzerinden bağlayın.
+
+### Telefondan erişemiyorsan kontrol listesi
+
+| Belirti | Olası sebep | Çözüm |
+|---|---|---|
+| Tarayıcı "bağlanamadı" | Güvenlik duvarı / Public profil | Yukarıdaki firewall komutu |
+| `http://<IP>:8080/health` açılıyor ama `:3000` açılmıyor | Frontend konteyneri ayakta değil | `docker compose ps`, `docker compose up -d` |
+| Sayfa açılıyor, veriler gelmiyor | Backend ayakta değil | `docker compose logs backend --tail 30` |
+| Çok yavaş | 565 KB ekipman ağacı, zayıf Wi-Fi | Normal; gzip açık, ilk yükleme ~1 sn |
+| Adres hiç açılmıyor, IP doğru | Telefon farklı ağda (misafir ağı/mobil veri) | Aynı Wi-Fi'ya bağla |
 
 ---
 
@@ -706,14 +783,27 @@ Seviye kuralı: `tesis → hat → makine → bilesen`. Makine doğrudan tesis a
 
 ### Mobil (telefondan) açılmıyor
 
-1. **API adresi:** Telefonda `localhost` çalışmaz. `VITE_API_URL` bilgisayarın IP'si
-   olmalı; değiştirdikten sonra `docker compose up -d --build frontend`.
-2. **Güvenlik duvarı:** Windows Defender → Gelen Kuralları → 3000 ve 8080 TCP izinli mi?
-   Hızlı test: telefondan `http://<IP>:8080/health` açılıyorsa backend erişilebilir.
-3. **Aynı ağ:** Telefon mobil veride değil, aynı Wi-Fi'da olmalı. Misafir ağı (guest
-   network) cihazlar arası trafiği çoğu zaman bloklar.
-4. **Docker binding:** `docker compose ps` çıktısında `0.0.0.0:3000->8080/tcp` görmelisiniz.
-   `127.0.0.1:3000->...` yazıyorsa yalnızca bilgisayardan erişilebilir.
+1. **Güvenlik duvarı / ağ profili (en sık sebep):** Docker kuralları yalnızca
+   `Private` profilde izin verir. Ağ `Public` ise istek sessizce düşer.
+   ```powershell
+   Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory
+   # Public ise (yönetici PowerShell):
+   Set-NetConnectionProfile -InterfaceAlias "Ethernet" -NetworkCategory Private
+   ```
+2. **Doğru IP:** `ipconfig` çıktısında **kullanılan** adaptörün IPv4'ünü al.
+   `Deprecated`/`Disconnected` görünen adaptörün IP'si (örn. kopmuş Wi-Fi)
+   telefondan erişilemez. Artık API adresi göreli olduğu için **yeniden
+   derleme gerekmez**.
+3. **Aynı ağ:** Telefon mobil veride değil, aynı Wi-Fi'da olmalı. Misafir ağı
+   (guest network) cihazlar arası trafiği çoğu zaman bloklar.
+4. **Docker binding:** `docker compose ps` çıktısında `0.0.0.0:3000->8080/tcp`
+   görmelisiniz. `127.0.0.1:3000->...` yazıyorsa yalnızca bilgisayardan erişilebilir.
+5. **Proxy kontrolü:** Sayfa açılıp veriler gelmiyorsa backend'e ulaşan yol kopuk
+   olabilir. Bilgisayardan test:
+   ```bash
+   curl -s -o /dev/null -w "%{http_code}\n" http://localhost:3000/api/v1/auth/me
+   # 401 beklenir (uç çalışıyor, token yok). 502 ise backend ayakta değil.
+   ```
 
 ---
 
@@ -728,14 +818,27 @@ Seviye kuralı: `tesis → hat → makine → bilesen`. Makine doğrudan tesis a
 | — | `bakimplan_test` (`db_test`) | **Yalnızca testler**; ayrı konteyner, bellekte (`tmpfs`), demo veriyle ilgisiz |
 | `JWT_SECRET` | demo değeri | **Üretimde değiştirin** |
 | `SEED_VALUE` | `42` | Simülatör determinizm tohumu |
-| `VITE_API_URL` | `http://localhost:8080/api/v1` | Tarayıcının göreceği API adresi (**build arg** — değişince `--build` gerekir) |
+| `VITE_API_URL` | `/api/v1` | Tarayıcının kullanacağı API yolu (**build arg**). Göreli: nginx `/api/`'yi backend'e vekiller |
 | `K6_API_URL` | `http://backend:8080` | Yük testi hedefi |
 
-`VITE_API_URL` **derleme anında** JavaScript'in içine gömülür (Vite kuralı). Bu yüzden:
+`VITE_API_URL` **derleme anında** JavaScript'in içine gömülür (Vite kuralı), yani
+`restart` işe yaramaz; değişirse `docker compose up -d --build frontend` gerekir.
 
-- değeri değiştirdikten sonra `docker compose up -d --build frontend` şarttır,
-- `docker compose restart frontend` **işe yaramaz** (eski JS servis edilmeye devam eder),
-- doğrulamak için: `docker compose exec frontend sh -c "grep -o 'http://[a-z0-9.:]*/api/v1' /usr/share/nginx/html/assets/*.js | head -1"`
+**Varsayılan göreli (`/api/v1`) tutulmalı.** Mutlak bir adres yazılırsa (örn.
+`http://192.168.1.42:8080/api/v1`) IP değiştiğinde yeniden derlemek gerekir ve
+telefondan erişim kırılır — bu projede daha önce tam olarak bu sorun yaşandı.
+Göreli kullanımda:
+
+- hangi IP/hostname ile açılırsa açılsın çalışır (telefon dahil),
+- istek aynı kökene gittiği için CORS/preflight devreye girmez,
+- dışarıya yalnızca 3000 portu açılır (8080'e gerek yok).
+
+Doğrulamak için (mutlak adres **kalmamalı**):
+
+```bash
+docker compose exec frontend sh -c "grep -o 'http://[a-z0-9.:]*/api/v1' /usr/share/nginx/html/assets/*.js | head -1"
+# çıktı boş olmalı; doluysa mutlak adres gömülmüş demektir
+```
 
 `.env` dosyası git'e girmez (`.gitignore`'da). Dosya bulunmazsa `docker-compose.yml`
 içindeki `${VAR:-varsayılan}` değerleri kullanılır; yani sistem `.env` olmadan da

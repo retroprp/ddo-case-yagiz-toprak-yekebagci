@@ -55,13 +55,18 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        # Tarayıcının erişeceği API adresi. Vite bu değeri DERLEME ANINDA
-        # JavaScript'in içine gömer (runtime env okunmaz). Bu yüzden:
-        #   - değer değişince `docker compose up -d --build frontend` gerekir
-        #   - telefondan erişim için bilgisayarın LAN IP'si verilir:
-        #     VITE_API_URL=http://192.168.1.42:8080/api/v1
-        # Varsayılan, aynı makineden çalışan kurulumla uyumludur.
-        VITE_API_URL: ${VITE_API_URL:-http://localhost:8080/api/v1}
+        # API adresi. Vite bu değeri DERLEME ANINDA JavaScript'in içine gömer
+        # (runtime env okunmaz), bu yüzden değişince `--build` gerekir.
+        #
+        # Neden göreli "/api/v1": frontend nginx'i /api/ isteklerini compose
+        # ağındaki backend'e vekiller (bkz. frontend/nginx.conf). Böylece:
+        #   - IP/hostname değişse bile yeniden derleme GEREKMEZ,
+        #   - telefondan hangi IP ile açılırsa açılsın çalışır,
+        #   - aynı köken olduğu için CORS/preflight devreye girmez.
+        #
+        # Mutlak adresle derlemek isterseniz (eski davranış) .env'ye yazın:
+        #   VITE_API_URL=http://192.168.1.42:8080/api/v1
+        VITE_API_URL: ${VITE_API_URL:-/api/v1}
     ports:
       - "3000:8080"
     depends_on:
